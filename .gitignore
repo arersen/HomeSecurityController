@@ -1,0 +1,15 @@
+build/
+out/
+bin/
+
+*.o
+*.so
+*.a
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+.env
+local_build_config.cmake
