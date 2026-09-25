@@ -12,6 +12,7 @@ set(SOURCES
 	src/main.c
 	src/core/logger.c
 	src/core/events.c
+	src/gpio/buzzer.c
 	src/i2c/i2c.c
 	src/i2c/bme680.c
 	src/spi/spi.c
