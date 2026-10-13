@@ -25,4 +25,16 @@ add_executable(security_daemon ${SOURCES})
 find_package(Threads REQUIRED)
 target_link_libraries(security_daemon PRIVATE Threads::Threads)
 
+set(DEPLOY_USER "root" CACHE STRING "SSH user deploy")
+set(DEPLOY_HOST "192.168.0.183" CACHE STRING "IP deploy")
+set(DEPLOY_PATH "/root" CACHE STRING "Deploy path")
+
+add_custom_target(deploy
+		COMMAND scp -O $<TARGET_FILE:security_daemon>
+		${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/
+		DEPENDS security_daemon
+		COMMENT "Deploying security_daemon to ${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}"
+		VERBATIM
+)
+
 
