@@ -28,7 +28,7 @@ int main(void)
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGHUP, &sa, NULL);
 
-	if (gpio_init(&buzzer, "/dev/gpiochip4", 17, GPIO_DIR_OUTPUT, "buzzer") != GPIO_OK) {
+	if (gpio_init(&buzzer, "/dev/gpiochip0", 17, GPIO_DIR_OUTPUT, "buzzer") != GPIO_OK) {
 		fprintf(stderr, "Error: gpio_init failed\n");
 		return 1;
 	}
@@ -38,9 +38,9 @@ int main(void)
 
 	while (g_running) {
 		gpio_write(&buzzer, 1);
-		sleep_ms(200);
+		sleep_ms(10);
 		gpio_write(&buzzer, 0);
-		sleep_ms(200);
+		sleep_ms(10);
 	}
 
 	gpio_write(&buzzer, 0);
