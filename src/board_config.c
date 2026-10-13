@@ -3,7 +3,8 @@
 //
 #include "board_config.h"
 
-const int used_pins[] = { BUZZER_GPIO_OFFSET, RADAR_GPIO_OFFSET, TEST_GPIO_COLLISION_OFFSET };
+//const int used_pins[] = { BUZZER_GPIO_OFFSET, RADAR_GPIO_OFFSET, TEST_GPIO_COLLISION_OFFSET };
+const int used_pins[] = { BUZZER_GPIO_OFFSET, RADAR_GPIO_OFFSET };
 
 void check_pins_or_die(void) {
     size_t count = sizeof(used_pins) / sizeof(used_pins[0]);
