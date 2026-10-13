@@ -9,15 +9,17 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Werror=implicit-function-decl
 include_directories(include)
 
 set(SOURCES
-	src/main.c
-	src/core/logger.c
-	src/core/events.c
-	src/gpio/buzzer.c
-	src/i2c/i2c.c
-	src/i2c/bme680.c
-	src/spi/spi.c
-	src/spi/rc522.c
-	src/gpio/radar.c
+		src/main.c
+		src/core/logger.c
+		src/core/events.c
+		src/gpio/buzzer.c
+		src/i2c/i2c.c
+		src/i2c/bme680.c
+		src/spi/spi.c
+		src/spi/rc522.c
+		src/gpio/gpio.c
+		src/gpio/radar.c
+
 )
 
 add_executable(security_daemon ${SOURCES})
