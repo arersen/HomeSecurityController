@@ -19,7 +19,7 @@ set(SOURCES
 		src/spi/rc522.c
 		src/gpio/gpio.c
 		src/gpio/radar.c
-
+		src/etc.c
 )
 
 add_executable(security_daemon ${SOURCES})

@@ -1,8 +1,8 @@
 #include <stdio.h>
 #include <signal.h>
-#include <time.h>
 #include "gpio.h"
-
+#include "buzzer.h"
+#include "etc.h"
 static volatile sig_atomic_t g_running = 1;
 
 static void on_signal(int sig)
@@ -11,11 +11,7 @@ static void on_signal(int sig)
 	g_running = 0;
 }
 
-static void sleep_ms(long ms)
-{
-	struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
-	nanosleep(&ts, NULL);
-}
+
 
 int main(void)
 {
@@ -28,23 +24,22 @@ int main(void)
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGHUP, &sa, NULL);
 
-	if (gpio_init(&buzzer, "/dev/gpiochip0", 17, GPIO_DIR_OUTPUT, "buzzer") != GPIO_OK) {
-		fprintf(stderr, "Error: gpio_init failed\n");
-		return 1;
+	e_gpio_status buzzer_init_status = buzzer_init(&buzzer, BUZZER_GPIO_OFFSET);
+	if (buzzer_init_status != GPIO_OK) {
+		printf("buzzer_init failed\n");
+		return buzzer_init_status;
 	}
 
 	printf("Buzzer blinking, Ctrl+C to stop\n");
 	fflush(stdout);
 
 	while (g_running) {
-		gpio_write(&buzzer, 1);
-		sleep_ms(10);
-		gpio_write(&buzzer, 0);
-		sleep_ms(10);
+		buzzer_beep(&buzzer, 500);
+		sleep_ms(500);
 	}
 
-	gpio_write(&buzzer, 0);
-	gpio_deinit(&buzzer);
+
+	buzzer_deinit(&buzzer);
 	printf("Stopped\n");
 	return 0;
 }
