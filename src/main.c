@@ -12,6 +12,10 @@ static void on_signal(int sig)
 }
 
 
+__attribute__((constructor)) void setup(void) {
+	printf("setup\n");
+	check_pins_or_die();
+}
 
 int main(void)
 {

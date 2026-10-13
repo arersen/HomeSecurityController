@@ -8,8 +8,8 @@
 
 #include "gpio.h"
 #include "etc.h"
+#include "board_config.h"
 
-#define BUZZER_GPIO_OFFSET 27 // gpio pin
 
 e_gpio_status buzzer_init(gpio_t* buzzer, unsigned int offset);
 void buzzer_deinit(gpio_t* buzzer);
