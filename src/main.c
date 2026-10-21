@@ -5,6 +5,7 @@
 #include "etc.h"
 #include "radar.h"
 #include "traffic_light.h"
+#include <pthread.h>
 static volatile sig_atomic_t g_running = 1;
 
 static void on_signal(int sig)
@@ -19,6 +20,29 @@ __attribute__((constructor)) void setup(void) {
 	check_pins_or_die();
 }
 
+int j = 1;
+void animation(void* args) {
+	time_t start = time(NULL);
+
+	traffic_light_t tl;
+	if (traffic_light_init(&tl, "/dev/gpiochip0") != GPIO_OK) {
+		fprintf(stderr, "traffic light init failed\n");
+		return;
+	}
+
+
+	while (j) {
+		traffic_light_set(&tl, TL_RED);
+		sleep_ms(100);
+		traffic_light_set(&tl, TL_YELLOW);
+		sleep_ms(100);
+		traffic_light_set(&tl, TL_GREEN);
+		sleep_ms(100);
+	}
+
+	traffic_light_set(&tl, TL_OFF);
+	traffic_light_deinit(&tl);
+}
 int test(void) {
 	int counter = 0;
 	gpio_t buzzer;
@@ -39,7 +63,7 @@ int test(void) {
 		buzzer_deinit(&buzzer);
 		return EXIT_FAILURE;
 	}
-
+	radar_run_diagnostic(&radar, 10);
 	traffic_light_t tl;
 	if (traffic_light_init(&tl, "/dev/gpiochip0") != GPIO_OK) {
 		fprintf(stderr, "traffic light init failed\n");
@@ -47,7 +71,7 @@ int test(void) {
 	}
 
 	traffic_light_set(&tl, TL_RED);
-	radar_run_diagnostic(&radar, 10);
+
 
 	printf("Security daemon is ACTIVE. Press Ctrl+C to stop.\n");
 	fflush(stdout);

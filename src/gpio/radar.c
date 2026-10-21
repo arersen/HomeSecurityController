@@ -1,7 +1,7 @@
 #include "radar.h"
 #include <stdio.h>
 #include <time.h>
-
+#include <pthread.h>
 e_gpio_status radar_init(gpio_t* radar, unsigned int offset) {
     printf("[RADAR] Init on GPIO offset %d\n", offset);
     e_gpio_status status = gpio_init(radar, "/dev/gpiochip0", offset, GPIO_DIR_INPUT, "hw456_radar");
@@ -19,8 +19,11 @@ void radar_deinit(gpio_t* radar) {
 int radar_read(gpio_t* radar) {
     return gpio_read(radar);
 }
-
+extern int j;
+extern void* animation(void* args);
 void radar_run_diagnostic(gpio_t* radar, int timeout_sec) {
+    pthread_t thread;
+    pthread_create(&thread, NULL, animation, NULL);
     printf("\n=== Radar diagnostic started (%d sec) ===\n", timeout_sec);
     printf("Wave...\n");
 
@@ -44,4 +47,6 @@ void radar_run_diagnostic(gpio_t* radar, int timeout_sec) {
         sleep_ms(50);
     }
     printf("=== DIAGNOSTIC FINISHED ===\n\n");
+    j = 0;
+    pthread_join(thread, NULL);
 }
