@@ -21,6 +21,7 @@ set(SOURCES
 		src/gpio/radar.c
 		src/etc.c
 		src/board_config.c
+		src/gpio/traffic_light.c
 )
 
 add_executable(security_daemon ${SOURCES})
@@ -29,7 +30,7 @@ find_package(Threads REQUIRED)
 target_link_libraries(security_daemon PRIVATE Threads::Threads gpiod)
 
 set(DEPLOY_USER "root" CACHE STRING "SSH user deploy")
-set(DEPLOY_HOST "192.168.0.184" CACHE STRING "IP deploy")
+set(DEPLOY_HOST "192.168.137.127" CACHE STRING "IP deploy")
 set(DEPLOY_PATH "/root" CACHE STRING "Deploy path")
 
 #[[

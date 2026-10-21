@@ -4,6 +4,7 @@
 #include "buzzer.h"
 #include "etc.h"
 #include "radar.h"
+#include "traffic_light.h"
 static volatile sig_atomic_t g_running = 1;
 
 static void on_signal(int sig)
@@ -39,6 +40,13 @@ int test(void) {
 		return EXIT_FAILURE;
 	}
 
+	traffic_light_t tl;
+	if (traffic_light_init(&tl, "/dev/gpiochip0") != GPIO_OK) {
+		fprintf(stderr, "traffic light init failed\n");
+		return 1;
+	}
+
+	traffic_light_set(&tl, TL_RED);
 	radar_run_diagnostic(&radar, 10);
 
 	printf("Security daemon is ACTIVE. Press Ctrl+C to stop.\n");
@@ -50,9 +58,10 @@ int test(void) {
 
 		if (current_state == 1 && last_radar_state == 0) {
 			printf("[%d] -> INTRUDER DETECTED! Sounding alarm!\n", counter++);
-			buzzer_beep(&buzzer, 500);
+			buzzer_beep(&buzzer, 1000);
 		} else if (current_state == 0 && last_radar_state == 1) {
 			printf("-> Area clear.\n");
+			buzzer_beep(&buzzer, 250);
 		}
 
 		last_radar_state = current_state;
@@ -63,7 +72,7 @@ int test(void) {
 	printf("\nShutting down safely...\n");
 	buzzer_deinit(&buzzer);
 	radar_deinit(&radar);
-
+	traffic_light_deinit(&tl);
 	return EXIT_SUCCESS;
 }
 int main(void)
