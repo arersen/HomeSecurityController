@@ -99,8 +99,33 @@ int test(void) {
 	traffic_light_deinit(&tl);
 	return EXIT_SUCCESS;
 }
+#include "rc522.h"
 int main(void)
 {
-	test();
+
+
+	rc522_t rfid;
+	rc522_card_t card;
+	char uid[RC522_UID_STR_LEN];
+
+	if (rc522_init(&rfid, RC522_SPI_DEV, 0, "/dev/gpiochip0", RC522_RST_GPIO_OFFSET) != RC522_OK) {
+		fprintf(stderr, "RC522 init failed\n");
+		return 1;
+	}
+	printf("RC522: %s\n", rc522_version_name(rfid.version));
+
+	while (g_running) {
+		rc522_status_t st = rc522_read_card(&rfid, &card, 0);
+		if (st == RC522_OK) {
+			printf("Card %s (%s)\n", rc522_uid_to_str(&card, uid, sizeof(uid)),
+				   rc522_card_type_name(card.type));
+			rc522_halt(&rfid);   /* та сама картка не спрацює повторно, поки її не приберуть */
+		} else if (st != RC522_ERR_NO_CARD) {
+			fprintf(stderr, "RC522: %s\n", rc522_strerror(st));
+		}
+		sleep_ms(100);
+	}
+	rc522_deinit(&rfid);
+	//test();
 
 }

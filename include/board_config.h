@@ -17,6 +17,8 @@
 #define YLIGHT_GPIO_OFFSET 26
 #define GLIGHT_GPIO_OFFSET 23
 
+#define RC522_SPI_DEV         "/dev/spidev0.0"
+#define RC522_RST_GPIO_OFFSET 25
 
 
 void check_pins_or_die(void);
