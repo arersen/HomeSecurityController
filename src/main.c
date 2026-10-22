@@ -100,7 +100,132 @@ int test(void) {
 	return EXIT_SUCCESS;
 }
 #include "rc522.h"
-int main(void)
+/*
+ * Безпечне копіювання MIFARE Classic 1K: тільки блоки даних.
+ * НЕ пише block 0 (UID виробника) і НЕ пише sector trailer (блоки 3,7,11,...),
+ * тому картку неможливо заблокувати. Ключі й UID не копіюються.
+ * Працює лише між картками із заводським ключем FF*6.
+ */
+
+#define COPY_DATA_SIZE 752   /* 1K мінус block0 і 16 трейлерів = 47 блоків * 16 */
+
+static int block_is_copyable(uint8_t block)
+{
+	return block != 0 && !rc522_mifare_is_trailer(block);
+}
+
+/* Чекає, поки піднесуть картку, і повертає її (або 0 при Ctrl+C) */
+static int wait_for_card(rc522_t *rfid, rc522_card_t *card, const char *prompt)
+{
+	printf("%s", prompt);
+	fflush(stdout);
+	while (g_running) {
+		if (rc522_read_card(rfid, card, 1) == RC522_OK) {
+			char uid[RC522_UID_STR_LEN];
+			printf(" %s (%s)\n", rc522_uid_to_str(card, uid, sizeof(uid)),
+			       rc522_card_type_name(card->type));
+			return 1;
+		}
+		sleep_ms(150);
+	}
+	printf("\n");
+	return 0;
+}
+
+/* Читає всі копійовані блоки у dst[47][16]. Повертає 0 при успіху. */
+static int read_source(rc522_t *rfid, rc522_card_t *card, uint8_t dst[47][16])
+{
+	int idx = 0;
+
+	for (uint8_t sector = 0; sector < 16; sector++) {
+		uint8_t first = (uint8_t)(sector * 4);
+
+		if (rc522_mifare_auth(rfid, card, RC522_KEY_A, first, RC522_KEY_DEFAULT) != RC522_OK) {
+			printf("Sector %u: не відкривається заводським ключем, копіювання скасовано\n", sector);
+			return -1;
+		}
+		for (uint8_t b = first; b < first + 4; b++) {
+			if (!block_is_copyable(b))
+				continue;
+			if (rc522_mifare_read(rfid, b, dst[idx]) != RC522_OK) {
+				printf("Block %u: помилка читання\n", b);
+				return -1;
+			}
+			idx++;
+		}
+	}
+	return 0;
+}
+#include <memory.h>
+/* Пише блоки на ціль і перевіряє читанням. Повертає кількість змінених блоків. */
+static int write_dest(rc522_t *rfid, rc522_card_t *card, uint8_t src[47][16])
+{
+	int idx = 0, written = 0;
+
+	for (uint8_t sector = 0; sector < 16; sector++) {
+		uint8_t first = (uint8_t)(sector * 4);
+
+		if (rc522_mifare_auth(rfid, card, RC522_KEY_A, first, RC522_KEY_DEFAULT) != RC522_OK) {
+			printf("Sector %u: ціль не відкривається заводським ключем, пропускаю\n", sector);
+			idx += 3;   /* 3 блоки даних у секторі */
+			continue;
+		}
+		for (uint8_t b = first; b < first + 4; b++) {
+			uint8_t check[16];
+
+			if (!block_is_copyable(b))
+				continue;
+
+			if (rc522_mifare_write(rfid, b, src[idx]) != RC522_OK) {
+				printf("Block %u: помилка запису\n", b);
+			} else if (rc522_mifare_read(rfid, b, check) != RC522_OK ||
+			           memcmp(check, src[idx], 16) != 0) {
+				printf("Block %u: перевірка не збіглася\n", b);
+			} else {
+				written++;
+			}
+			idx++;
+		}
+	}
+	return written;
+}
+
+static void copy_tool(rc522_t *rfid)
+{
+	static uint8_t data[47][16];   /* static: 752 байти не на стеку */
+	rc522_card_t src, dst;
+
+	printf("\n=== Копіювання MIFARE (тільки дані, UID і ключі не чіпаються) ===\n");
+
+	if (!wait_for_card(rfid, &src, "Піднеси ДЖЕРЕЛО..."))
+		return;
+	if (src.type != RC522_CARD_MIFARE_1K) {
+		printf("Поки підтримується лише MIFARE Classic 1K\n");
+		return;
+	}
+	if (read_source(rfid, &src, data) != 0)
+		return;
+	rc522_halt(rfid);
+	printf("Прочитано 47 блоків даних. Прибери джерело.\n");
+	sleep_ms(1500);
+
+	if (!wait_for_card(rfid, &dst, "Піднеси ЦІЛЬ (буде перезаписано)..."))
+		return;
+	if (dst.type != RC522_CARD_MIFARE_1K) {
+		printf("Ціль має бути MIFARE Classic 1K\n");
+		return;
+	}
+	if (rc522_uid_equal(&src, &dst)) {
+		printf("Це та сама картка, нічого копіювати\n");
+		return;
+	}
+
+	int n = write_dest(rfid, &dst, data);
+	rc522_halt(rfid);
+	printf("Готово: записано й перевірено %d / 47 блоків\n\n", n);
+}
+#include <string.h>
+int main(int argc, char** argv)
 {
 
 
@@ -108,11 +233,18 @@ int main(void)
 	rc522_card_t card;
 	char uid[RC522_UID_STR_LEN];
 
-	if (rc522_init(&rfid, RC522_SPI_DEV, 0, "/dev/gpiochip0", RC522_RST_GPIO_OFFSET) != RC522_OK) {
-		fprintf(stderr, "RC522 init failed\n");
+	rc522_status_t rc522_init_status = rc522_init(&rfid, RC522_SPI_DEV, 0, "/dev/gpiochip0", RC522_RST_GPIO_OFFSET);
+	if (rc522_init_status != RC522_OK) {
+		fprintf(stderr, "RC522 init failed, code: %d\n", rc522_init_status);
 		return 1;
 	}
 	printf("RC522: %s\n", rc522_version_name(rfid.version));
+
+	if (argc > 1 && strcmp(argv[1], "--copy") == 0) {
+		copy_tool(&rfid);
+		rc522_deinit(&rfid);
+		return 0;
+	}
 
 	while (g_running) {
 		rc522_status_t st = rc522_read_card(&rfid, &card, 0);

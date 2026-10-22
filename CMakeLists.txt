@@ -44,7 +44,7 @@ add_custom_target(deploy
 )
 ]]
 
-set(SSH_OPTS -o BatchMode=yes -o ConnectTimeout=5)
+set(SSH_OPTS -o BatchMode=yes -o ConnectTimeout=20)
 
 add_custom_target(deploy
 		COMMAND ssh ${SSH_OPTS} ${DEPLOY_USER}@${DEPLOY_HOST} "killall security_daemon 2>/dev/null || true"
