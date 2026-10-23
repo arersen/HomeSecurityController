@@ -147,6 +147,7 @@ static const char *authorize(const rc522_card_t *card)
 #define AC_POLL_MS            50
 #define AC_MOTION_CLEAR_MS    1200    /* рух має зникнути на стільки, щоб вважати прохід завершеним */
 #define AC_UNLOCK_TIMEOUT_MS  15000   /* ніхто не пройшов за цей час -> знову блокуємо (0 = вимкнено) */
+#define AC_INTRUSION_MS       2000    /* рух без картки довше цього -> тривога (дає час піднести картку; 0 = вимкнено) */
 
 static uint64_t ac_now_ms(void)
 {
@@ -176,7 +177,7 @@ int access_control(rc522_t *rfid)
 	gpio_t buzzer, radar;
 	traffic_light_t tl;
 	ac_state_t state = AC_LOCKED;
-	uint64_t unlock_ts = 0, last_motion_ts = 0;
+	uint64_t unlock_ts = 0, last_motion_ts = 0, intrusion_ts = 0;
 	char uid[RC522_UID_STR_LEN];
 
 	if (buzzer_init(&buzzer, BUZZER_GPIO_OFFSET) != GPIO_OK)
@@ -205,6 +206,7 @@ int access_control(rc522_t *rfid)
 			if (st == RC522_OK) {
 				const char *who = authorize(&card);
 
+				intrusion_ts = 0;   /* людина біля зчитувача — це не прохід без картки */
 				rc522_uid_to_str(&card, uid, sizeof(uid));
 				if (who) {
 					printf("[ACCESS] GRANTED: %s (%s) -> UNLOCKED\n", who, uid);
@@ -217,8 +219,20 @@ int access_control(rc522_t *rfid)
 					beep_times(&buzzer, AC_DENY_BEEPS);   /* лишаємось LOCKED */
 				}
 				rc522_halt(rfid);
-			} else if (st != RC522_ERR_NO_CARD) {
-				/* перехідні помилки (картку сіпнули на краю поля) ігноруємо */
+			} else {
+				/* Картки немає (або перехідна помилка). Якщо радар бачить рух,
+				 * це спроба пройти без картки -> тривога, коли рух триває. */
+				if (AC_INTRUSION_MS > 0 && radar_read(&radar) == 1) {
+					if (intrusion_ts == 0) {
+						intrusion_ts = ac_now_ms();                  /* почали рахувати */
+					} else if (ac_now_ms() - intrusion_ts > AC_INTRUSION_MS) {
+						printf("[ALARM] INTRUSION: рух без картки!\n");
+						beep_times(&buzzer, AC_DENY_BEEPS);          /* 10 біпів */
+						intrusion_ts = ac_now_ms();                  /* ре-арм: завиє знову, якщо рух не припиниться */
+					}
+				} else {
+					intrusion_ts = 0;                                /* чисто -> скидаємо лічильник */
+				}
 			}
 			sleep_ms(AC_POLL_MS);
 			break;
@@ -235,6 +249,7 @@ int access_control(rc522_t *rfid)
 				printf("[ACCESS] nobody passed in time -> LOCKED\n");
 				traffic_light_set(&tl, TL_RED);
 				beep_short(&buzzer);
+				intrusion_ts = 0;
 				state = AC_LOCKED;
 			}
 			sleep_ms(AC_POLL_MS);
@@ -249,6 +264,7 @@ int access_control(rc522_t *rfid)
 				printf("[ACCESS] passage complete -> LOCKED\n");
 				traffic_light_set(&tl, TL_RED);
 				beep_short(&buzzer);   /* короткий біп = знову заблоковано, чекаємо наступне розблокування */
+				intrusion_ts = 0;
 				state = AC_LOCKED;
 			}
 			sleep_ms(AC_POLL_MS);
