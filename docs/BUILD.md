@@ -79,8 +79,7 @@ bootloader/firmware Pi 5). Тому за основу взято **Raspberry Pi 
 > cat /etc/os-release      # "Buildroot ..." -> корінь Buildroot; "Debian ..." -> Pi OS Lite
 > cat /proc/1/comm         # init (BusyBox) -> Buildroot; systemd -> Pi OS
 > ```
-> Для захисту: мінімум — **власне ядро Buildroot** поверх firmware Pi; якщо корінь
-> теж від Buildroot — це повністю власний образ (ядро + userland).
+
 
 ---
 
