@@ -1,0 +1,33 @@
+[Unit]
+Description=Home Security Controller access-control daemon
+Documentation=https://github.com/jambyl/HomeSecurityController
+After=basic.target
+# не крутити рестарти нескінченно, якщо немає заліза (SPI/GPIO)
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# шляхи бази карток і журналу (демон їх читає зі змінних оточення)
+Environment=SECURITY_CARDS_DB=/etc/security_daemon/cards.db
+Environment=SECURITY_LOG=/var/log/security_daemon.log
+ExecStart=/usr/bin/security_daemon
+# `systemctl reload security_daemon` -> SIGHUP -> перечитати базу карток без рестарту
+ExecReload=/bin/kill -HUP $MAINPID
+# stdout демона (логер дублює туди події) потрапляє в journald:
+#   journalctl -u security_daemon -f
+Restart=on-failure
+RestartSec=3
+# коректна зупинка: SIGTERM -> демон ловить його і гасить GPIO
+KillSignal=SIGTERM
+TimeoutStopSec=5
+
+# --- необов'язкове посилення (гарно для захисту; вмикай за потреби) ---
+# DeviceAllow=/dev/spidev0.0 rw
+# DeviceAllow=/dev/gpiochip0 rw
+# ProtectSystem=strict
+# ReadWritePaths=/var/log /etc/security_daemon
+# NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,47 @@
+#!/bin/sh
+#
+# S99security-daemon — запуск Home Security Controller під BusyBox init.
+# Кладеться в /etc/init.d/ ; BusyBox rcS виконує S?? скрипти по порядку.
+#
+
+DAEMON="security_daemon"
+DAEMON_PATH="/usr/bin/${DAEMON}"
+PIDFILE="/var/run/${DAEMON}.pid"
+
+# шляхи бази карток і журналу
+export SECURITY_CARDS_DB="/etc/security_daemon/cards.db"
+export SECURITY_LOG="/var/log/security_daemon.log"
+
+start() {
+	printf 'Starting %s: ' "${DAEMON}"
+	# -b: демон foreground -> у фон; -m: створити pidfile; -x: виконуваний файл
+	start-stop-daemon -S -q -b -m -p "${PIDFILE}" -x "${DAEMON_PATH}"
+	if [ $? -eq 0 ]; then echo "OK"; else echo "FAIL"; fi
+}
+
+stop() {
+	printf 'Stopping %s: ' "${DAEMON}"
+	# за замовчуванням шле SIGTERM -> демон коректно гасить GPIO
+	start-stop-daemon -K -q -p "${PIDFILE}"
+	if [ $? -eq 0 ]; then echo "OK"; else echo "FAIL"; fi
+	rm -f "${PIDFILE}"
+}
+
+reload() {
+	printf 'Reloading %s (SIGHUP -> перечитати картки): ' "${DAEMON}"
+	start-stop-daemon -K -s HUP -q -p "${PIDFILE}"
+	echo "OK"
+}
+
+case "$1" in
+	start)   start ;;
+	stop)    stop ;;
+	restart) stop; sleep 1; start ;;
+	reload)  reload ;;
+	*)
+		echo "Usage: $0 {start|stop|restart|reload}"
+		exit 1
+		;;
+esac
+
+exit $?
