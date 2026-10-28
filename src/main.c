@@ -1,293 +1,331 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <signal.h>
+#include <time.h>
+#include <pthread.h>
+
 #include "gpio.h"
 #include "buzzer.h"
 #include "etc.h"
 #include "radar.h"
 #include "traffic_light.h"
-#include <pthread.h>
-static volatile sig_atomic_t g_running = 1;
+#include "rc522.h"
+#include "card_store.h"
 
-static void on_signal(int sig)
-{
-	(void)sig;
-	g_running = 0;
-}
+/* ---- Глобальні прапорці, якими керують сигнали ---- */
+static volatile sig_atomic_t g_running = 1;
+static volatile sig_atomic_t g_reload  = 0;   /* SIGHUP -> перечитати базу карток */
+
+static void on_stop(int sig)   { (void)sig; g_running = 0; }
+static void on_reload(int sig) { (void)sig; g_reload = 1; }
 
 static void install_signals(void)
 {
-	struct sigaction sa = {0};
-	sa.sa_handler = on_signal;
-	sigemptyset(&sa.sa_mask);     /* без SA_RESTART, щоб sleep_ms переривався одразу */
-	sigaction(SIGINT, &sa, NULL);
-	sigaction(SIGTERM, &sa, NULL);
-	sigaction(SIGHUP, &sa, NULL);
-}
+	struct sigaction stop = {0}, hup = {0};
 
+	stop.sa_handler = on_stop;
+	sigemptyset(&stop.sa_mask);     /* без SA_RESTART: sleep_ms переривається одразу */
+	sigaction(SIGINT, &stop, NULL);
+	sigaction(SIGTERM, &stop, NULL);
+
+	hup.sa_handler = on_reload;
+	sigemptyset(&hup.sa_mask);
+	sigaction(SIGHUP, &hup, NULL);
+}
 
 __attribute__((constructor)) void setup(void) {
 	printf("setup\n");
 	check_pins_or_die();
 }
 
+/* Анімація світлофора у фоновому потоці (діагностика радара).
+ * Потрібна як символ для radar_run_diagnostic (extern j, animation). */
 int j = 1;
-void animation(void* args) {
-	time_t start = time(NULL);
+void *animation(void *args)
+{
+	(void)args;
 
 	traffic_light_t tl;
 	if (traffic_light_init(&tl, "/dev/gpiochip0") != GPIO_OK) {
 		fprintf(stderr, "traffic light init failed\n");
-		return;
+		return NULL;
 	}
-
-
 	while (j) {
-		traffic_light_set(&tl, TL_RED);
-		sleep_ms(100);
-		traffic_light_set(&tl, TL_YELLOW);
-		sleep_ms(100);
-		traffic_light_set(&tl, TL_GREEN);
-		sleep_ms(100);
+		traffic_light_set(&tl, TL_RED);    sleep_ms(100);
+		traffic_light_set(&tl, TL_YELLOW); sleep_ms(100);
+		traffic_light_set(&tl, TL_GREEN);  sleep_ms(100);
 	}
-
 	traffic_light_set(&tl, TL_OFF);
 	traffic_light_deinit(&tl);
-}
-int test(void) {
-	int counter = 0;
-	gpio_t buzzer;
-	gpio_t radar;
-
-	install_signals();
-
-	if (buzzer_init(&buzzer, BUZZER_GPIO_OFFSET) != GPIO_OK) {
-		return EXIT_FAILURE;
-	}
-
-	if (radar_init(&radar, RADAR_GPIO_OFFSET) != GPIO_OK) {
-		buzzer_deinit(&buzzer);
-		return EXIT_FAILURE;
-	}
-	radar_run_diagnostic(&radar, 10);
-	traffic_light_t tl;
-	if (traffic_light_init(&tl, "/dev/gpiochip0") != GPIO_OK) {
-		fprintf(stderr, "traffic light init failed\n");
-		return 1;
-	}
-
-	traffic_light_set(&tl, TL_RED);
-
-
-	printf("Security daemon is ACTIVE. Press Ctrl+C to stop.\n");
-	fflush(stdout);
-
-	int last_radar_state = 0;
-	while (g_running) {
-		int current_state = radar_read(&radar);
-
-		if (current_state == 1 && last_radar_state == 0) {
-			printf("[%d] -> INTRUDER DETECTED! Sounding alarm!\n", counter++);
-			buzzer_beep(&buzzer, 1000);
-		} else if (current_state == 0 && last_radar_state == 1) {
-			printf("-> Area clear.\n");
-			buzzer_beep(&buzzer, 250);
-		}
-
-		last_radar_state = current_state;
-
-		sleep_ms(100);
-	}
-
-	printf("\nShutting down safely...\n");
-	buzzer_deinit(&buzzer);
-	radar_deinit(&radar);
-	traffic_light_deinit(&tl);
-	return EXIT_SUCCESS;
-}
-#include "rc522.h"
-#include <string.h>
-#include <time.h>
-
-/* ============================================================
- *  Контроль доступу (кінцевий автомат на 3 стани)
- *
- *  LOCKED   — червоний. Чекаємо картку.
- *             картка в списку  -> зелений + 1 короткий біп, UNLOCKED
- *             невідома картка   -> лишається червоний + 10 біпів (відмова)
- *  UNLOCKED — зелений. Радар побачив рух -> жовтий, PASSING.
- *             (якщо ніхто не пройшов за AC_UNLOCK_TIMEOUT_MS -> знову LOCKED)
- *  PASSING  — жовтий, поки радар бачить рух. Рух зник (антидребезг
- *             AC_MOTION_CLEAR_MS) -> червоний + 1 короткий біп, LOCKED.
- * ============================================================ */
-
-/* --- Список дозволених карток. Додавай свої UID сюди. --- */
-typedef struct {
-	uint8_t     uid[RC522_UID_MAX];
-	uint8_t     len;
-	const char *name;
-} authorized_card_t;
-
-static const authorized_card_t g_allowlist[] = {
-	{ { 0x07, 0x84, 0x80, 0x33 }, 4, "Arsen" },
-	{ { 0x25, 0x58, 0x9F, 0xE0 }, 4, "Guest" },
-};
-
-static const char *authorize(const rc522_card_t *card)
-{
-	for (size_t i = 0; i < sizeof(g_allowlist) / sizeof(g_allowlist[0]); i++)
-		if (rc522_uid_match(card, g_allowlist[i].uid, g_allowlist[i].len))
-			return g_allowlist[i].name;
 	return NULL;
 }
 
-/* --- Параметри поведінки --- */
-#define AC_SHORT_BEEP_MS      60
-#define AC_DENY_BEEPS         10
-#define AC_BEEP_GAP_MS        90
-#define AC_POLL_MS            50
-#define AC_MOTION_CLEAR_MS    1200    /* рух має зникнути на стільки, щоб вважати прохід завершеним */
-#define AC_UNLOCK_TIMEOUT_MS  15000   /* ніхто не пройшов за цей час -> знову блокуємо (0 = вимкнено) */
-#define AC_INTRUSION_MS       2000    /* рух без картки довше цього -> тривога (дає час піднести картку; 0 = вимкнено) */
+/* Шлях до бази карток: змінна оточення або типовий. */
+static const char *cards_db_path(void)
+{
+	const char *p = getenv("SECURITY_CARDS_DB");
+	return (p && *p) ? p : "/root/cards.db";
+}
 
-static uint64_t ac_now_ms(void)
+static uint64_t now_ms(void)
 {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
-static void beep_short(gpio_t *buzzer)
-{
-	buzzer_beep(buzzer, AC_SHORT_BEEP_MS);
-}
+/* ============================================================
+ *  Контроль доступу (неблокуючий кінцевий автомат)
+ *
+ *  LOCKED   — червоний. Відома картка -> зелений + короткий біп, UNLOCKED.
+ *             Невідома картка -> 10 біпів (відмова).
+ *             Рух без картки довше AC_INTRUSION_MS -> 10 біпів (тривога).
+ *  UNLOCKED — зелений. Рух -> жовтий, PASSING. Таймаут -> знову LOCKED.
+ *  PASSING  — жовтий, поки є рух. Рух зник (антидребезг) -> червоний + біп, LOCKED.
+ *
+ *  Головний цикл не блокується: зумер грає через buzzer_ctl_tick, тож радар і
+ *  зчитувач опитуються навіть під час сигналізації. SIGHUP перечитує базу.
+ * ============================================================ */
 
-static void beep_times(gpio_t *buzzer, int n)
-{
-	for (int i = 0; i < n && g_running; i++) {
-		buzzer_beep(buzzer, AC_SHORT_BEEP_MS);
-		if (i + 1 < n)
-			sleep_ms(AC_BEEP_GAP_MS);
-	}
-}
+#define AC_LOOP_MS            20      /* період головного циклу */
+#define AC_CARD_POLL_MS       120     /* як часто питати зчитувач у стані LOCKED */
+#define AC_SHORT_BEEP_MS      60
+#define AC_DENY_BEEPS         10
+#define AC_BEEP_ON_MS         60
+#define AC_BEEP_OFF_MS        90
+#define AC_MOTION_CLEAR_MS    1200    /* рух має зникнути на стільки -> прохід завершено */
+#define AC_UNLOCK_TIMEOUT_MS  15000   /* ніхто не пройшов -> знову блокуємо (0 = вимкнено) */
+#define AC_INTRUSION_MS       2000    /* рух без картки довше цього -> тривога (0 = вимкнено) */
 
 typedef enum { AC_LOCKED, AC_UNLOCKED, AC_PASSING } ac_state_t;
 
-int access_control(rc522_t *rfid)
+static void maybe_reload(card_store_t *store, const char *db)
 {
-	gpio_t buzzer, radar;
-	traffic_light_t tl;
-	ac_state_t state = AC_LOCKED;
-	uint64_t unlock_ts = 0, last_motion_ts = 0, intrusion_ts = 0;
-	char uid[RC522_UID_STR_LEN];
+	if (!g_reload)
+		return;
+	g_reload = 0;
+	if (card_store_load(store, db) == 0)
+		printf("[DB] перечитано: %zu карток\n", store->count);
+	else
+		fprintf(stderr, "[DB] помилка перечитування '%s'\n", db);
+	fflush(stdout);
+}
 
-	if (buzzer_init(&buzzer, BUZZER_GPIO_OFFSET) != GPIO_OK)
+int access_control(rc522_t *rfid, card_store_t *store, const char *db)
+{
+	gpio_t         buzzer_pin, radar;
+	traffic_light_t tl;
+	buzzer_ctl_t   buzzer;
+	ac_state_t     state = AC_LOCKED;
+	uint64_t       unlock_ts = 0, last_motion_ts = 0, intrusion_ts = 0, last_card_poll = 0;
+	char           uid[RC522_UID_STR_LEN];
+
+	if (buzzer_init(&buzzer_pin, BUZZER_GPIO_OFFSET) != GPIO_OK)
 		return EXIT_FAILURE;
 	if (radar_init(&radar, RADAR_GPIO_OFFSET) != GPIO_OK) {
-		buzzer_deinit(&buzzer);
+		buzzer_deinit(&buzzer_pin);
 		return EXIT_FAILURE;
 	}
 	if (traffic_light_init(&tl, "/dev/gpiochip0") != GPIO_OK) {
 		fprintf(stderr, "traffic light init failed\n");
 		radar_deinit(&radar);
-		buzzer_deinit(&buzzer);
+		buzzer_deinit(&buzzer_pin);
 		return EXIT_FAILURE;
 	}
+	buzzer_ctl_init(&buzzer, &buzzer_pin);
 
 	traffic_light_set(&tl, TL_RED);
-	printf("Access control ACTIVE (LOCKED). Ctrl+C to stop.\n");
+	printf("Access control ACTIVE (LOCKED). %zu карток у базі. Ctrl+C — стоп.\n",
+	       store->count);
 	fflush(stdout);
 
 	while (g_running) {
+		uint64_t now = now_ms();
+
+		maybe_reload(store, db);
+		buzzer_ctl_tick(&buzzer, now);
+
 		switch (state) {
-		case AC_LOCKED: {
-			rc522_card_t card;
-			rc522_status_t st = rc522_read_card(rfid, &card, 0);
+		case AC_LOCKED:
+			/* зчитувач опитуємо не щотіка, щоб не навантажувати SPI */
+			if (now - last_card_poll >= AC_CARD_POLL_MS) {
+				rc522_card_t card;
+				rc522_status_t st;
 
-			if (st == RC522_OK) {
-				const char *who = authorize(&card);
+				last_card_poll = now;
+				st = rc522_read_card(rfid, &card, 0);
+				if (st == RC522_OK) {
+					const char *who = card_store_find(store, card.uid, card.uid_len);
 
-				intrusion_ts = 0;   /* людина біля зчитувача — це не прохід без картки */
-				rc522_uid_to_str(&card, uid, sizeof(uid));
-				if (who) {
-					printf("[ACCESS] GRANTED: %s (%s) -> UNLOCKED\n", who, uid);
-					traffic_light_set(&tl, TL_GREEN);
-					beep_short(&buzzer);
-					unlock_ts = ac_now_ms();
-					state = AC_UNLOCKED;
-				} else {
-					printf("[ACCESS] DENIED: unknown card %s\n", uid);
-					beep_times(&buzzer, AC_DENY_BEEPS);   /* лишаємось LOCKED */
+					intrusion_ts = 0;
+					rc522_uid_to_str(&card, uid, sizeof(uid));
+					if (who) {
+						printf("[ACCESS] GRANTED: %s (%s) -> UNLOCKED\n", who, uid);
+						traffic_light_set(&tl, TL_GREEN);
+						buzzer_ctl_start(&buzzer, 1, AC_SHORT_BEEP_MS, 0, now);
+						unlock_ts = now;
+						state = AC_UNLOCKED;
+					} else {
+						printf("[ACCESS] DENIED: unknown card %s\n", uid);
+						buzzer_ctl_start(&buzzer, AC_DENY_BEEPS, AC_BEEP_ON_MS, AC_BEEP_OFF_MS, now);
+					}
+					rc522_halt(rfid);
+					fflush(stdout);
 				}
-				rc522_halt(rfid);
-			} else {
-				/* Картки немає (або перехідна помилка). Якщо радар бачить рух,
-				 * це спроба пройти без картки -> тривога, коли рух триває. */
-				if (AC_INTRUSION_MS > 0 && radar_read(&radar) == 1) {
+			}
+
+			/* прохід без картки -> тривога (радар опитуємо щотіка) */
+			if (state == AC_LOCKED && AC_INTRUSION_MS > 0) {
+				if (radar_read(&radar) == 1) {
 					if (intrusion_ts == 0) {
-						intrusion_ts = ac_now_ms();                  /* почали рахувати */
-					} else if (ac_now_ms() - intrusion_ts > AC_INTRUSION_MS) {
+						intrusion_ts = now;
+					} else if (now - intrusion_ts > AC_INTRUSION_MS) {
 						printf("[ALARM] INTRUSION: рух без картки!\n");
-						beep_times(&buzzer, AC_DENY_BEEPS);          /* 10 біпів */
-						intrusion_ts = ac_now_ms();                  /* ре-арм: завиє знову, якщо рух не припиниться */
+						fflush(stdout);
+						buzzer_ctl_start(&buzzer, AC_DENY_BEEPS, AC_BEEP_ON_MS, AC_BEEP_OFF_MS, now);
+						intrusion_ts = now;   /* ре-арм, поки рух триває */
 					}
 				} else {
-					intrusion_ts = 0;                                /* чисто -> скидаємо лічильник */
+					intrusion_ts = 0;
 				}
 			}
-			sleep_ms(AC_POLL_MS);
 			break;
-		}
 
-		case AC_UNLOCKED: {
+		case AC_UNLOCKED:
 			if (radar_read(&radar) == 1) {
 				printf("[ACCESS] passage started -> PASSING\n");
+				fflush(stdout);
 				traffic_light_set(&tl, TL_YELLOW);
-				last_motion_ts = ac_now_ms();
+				last_motion_ts = now;
 				state = AC_PASSING;
-			} else if (AC_UNLOCK_TIMEOUT_MS > 0 &&
-			           ac_now_ms() - unlock_ts > AC_UNLOCK_TIMEOUT_MS) {
+			} else if (AC_UNLOCK_TIMEOUT_MS > 0 && now - unlock_ts > AC_UNLOCK_TIMEOUT_MS) {
 				printf("[ACCESS] nobody passed in time -> LOCKED\n");
+				fflush(stdout);
 				traffic_light_set(&tl, TL_RED);
-				beep_short(&buzzer);
+				buzzer_ctl_start(&buzzer, 1, AC_SHORT_BEEP_MS, 0, now);
 				intrusion_ts = 0;
 				state = AC_LOCKED;
 			}
-			sleep_ms(AC_POLL_MS);
 			break;
-		}
 
-		case AC_PASSING: {
+		case AC_PASSING:
 			if (radar_read(&radar) == 1)
-				last_motion_ts = ac_now_ms();
-
-			if (ac_now_ms() - last_motion_ts > AC_MOTION_CLEAR_MS) {
+				last_motion_ts = now;
+			if (now - last_motion_ts > AC_MOTION_CLEAR_MS) {
 				printf("[ACCESS] passage complete -> LOCKED\n");
+				fflush(stdout);
 				traffic_light_set(&tl, TL_RED);
-				beep_short(&buzzer);   /* короткий біп = знову заблоковано, чекаємо наступне розблокування */
+				buzzer_ctl_start(&buzzer, 1, AC_SHORT_BEEP_MS, 0, now);
 				intrusion_ts = 0;
+				last_card_poll = now;   /* не зчитувати залишок проходу як нову картку */
 				state = AC_LOCKED;
 			}
-			sleep_ms(AC_POLL_MS);
 			break;
 		}
-		}
+
+		sleep_ms(AC_LOOP_MS);
 	}
 
 	printf("\nShutting down...\n");
+	buzzer_ctl_cancel(&buzzer);
 	traffic_light_set(&tl, TL_RED);
-	buzzer_deinit(&buzzer);
+	buzzer_deinit(&buzzer_pin);
 	radar_deinit(&radar);
 	traffic_light_deinit(&tl);
 	return EXIT_SUCCESS;
 }
 
 /* ============================================================
- *  Безпечне копіювання MIFARE Classic 1K: тільки блоки даних.
- *  НЕ пише block 0 (UID виробника) і НЕ пише sector trailer,
- *  тому картку неможливо заблокувати. Ключі й UID не копіюються.
+ *  Адмін-команди: реєстрація / видалення / список карток
  * ============================================================ */
 
-#define COPY_DATA_SIZE 752   /* 1K мінус block0 і 16 трейлерів = 47 блоків * 16 */
+static int cmd_enroll(rc522_t *rfid, card_store_t *store, const char *db, const char *name)
+{
+	rc522_card_t card;
+	char uid[RC522_UID_STR_LEN];
+	int r;
+
+	if (!name || !*name) {
+		fprintf(stderr, "enroll: вкажи ім'я\n");
+		return 1;
+	}
+	printf("Піднеси картку для реєстрації '%s'... (Ctrl+C — скасувати)\n", name);
+	fflush(stdout);
+
+	while (g_running) {
+		if (rc522_read_card(rfid, &card, 1) == RC522_OK)
+			break;
+		sleep_ms(150);
+	}
+	if (!g_running)
+		return 1;
+
+	rc522_uid_to_str(&card, uid, sizeof(uid));
+	rc522_halt(rfid);
+
+	r = card_store_add(store, card.uid, card.uid_len, name);
+	if (r < 0) {
+		fprintf(stderr, "enroll: не вдалося додати картку\n");
+		return 1;
+	}
+	if (card_store_save(store, db) != 0) {
+		fprintf(stderr, "enroll: не вдалося зберегти базу '%s'\n", db);
+		return 1;
+	}
+	printf(r == 1 ? "Оновлено: %s -> %s\n" : "Додано: %s -> %s\n", uid, name);
+	return 0;
+}
+
+static int cmd_remove(card_store_t *store, const char *db, const char *uid_str)
+{
+	uint8_t uid[CARD_UID_MAX], uid_len;
+
+	if (card_uid_parse(uid_str, uid, &uid_len) != 0) {
+		fprintf(stderr, "remove: некоректний UID '%s' (очікую, напр., 25:58:9F:E0)\n", uid_str);
+		return 1;
+	}
+	if (card_store_remove(store, uid, uid_len) != 0) {
+		printf("Картки %s у базі немає\n", uid_str);
+		return 0;
+	}
+	if (card_store_save(store, db) != 0) {
+		fprintf(stderr, "remove: не вдалося зберегти базу '%s'\n", db);
+		return 1;
+	}
+	printf("Видалено: %s\n", uid_str);
+	return 0;
+}
+
+static void cmd_list(const card_store_t *store)
+{
+	char uid[CARD_UID_STRLEN];
+
+	printf("Дозволені картки (%zu):\n", store->count);
+	for (size_t i = 0; i < store->count; i++) {
+		card_uid_format(store->items[i].uid, store->items[i].uid_len, uid, sizeof(uid));
+		printf("  %-23s %s\n", uid, store->items[i].name);
+	}
+}
+
+static void usage(const char *prog)
+{
+	fprintf(stderr,
+		"Використання:\n"
+		"  %s                 запуск контролю доступу\n"
+		"  %s --enroll \"Ім'я\" зареєструвати піднесену картку\n"
+		"  %s --remove <uid>  видалити картку (напр. 25:58:9F:E0)\n"
+		"  %s --list          показати список карток\n"
+		"  %s --copy          копіювати MIFARE (дані)\n"
+		"База карток: $SECURITY_CARDS_DB або /root/cards.db. SIGHUP перечитує її.\n",
+		prog, prog, prog, prog, prog);
+}
+
+/* ============================================================
+ *  Безпечне копіювання MIFARE Classic 1K: тільки блоки даних.
+ *  НЕ пише block 0 і НЕ пише sector trailer, тому картку неможливо
+ *  заблокувати. Ключі й UID не копіюються.
+ * ============================================================ */
 
 static int block_is_copyable(uint8_t block)
 {
@@ -352,7 +390,6 @@ static int write_dest(rc522_t *rfid, rc522_card_t *card, uint8_t src[47][16])
 
 			if (!block_is_copyable(b))
 				continue;
-
 			if (rc522_mifare_write(rfid, b, src[idx]) != RC522_OK) {
 				printf("Block %u: помилка запису\n", b);
 			} else if (rc522_mifare_read(rfid, b, check) != RC522_OK ||
@@ -404,28 +441,56 @@ static void copy_tool(rc522_t *rfid)
 
 int main(int argc, char** argv)
 {
-	rc522_t rfid;
+	const char   *db = cards_db_path();
+	card_store_t  store;
+	rc522_t       rfid;
+	rc522_status_t rc522_st;
 	int rc;
 
 	install_signals();
+	card_store_init(&store);
+	if (card_store_load(&store, db) != 0)
+		fprintf(stderr, "Увага: не вдалося прочитати базу карток '%s'\n", db);
 
-	rc522_status_t rc522_init_status = rc522_init(&rfid, RC522_SPI_DEV, 0,
-	                                               "/dev/gpiochip0", RC522_RST_GPIO_OFFSET);
-	if (rc522_init_status != RC522_OK) {
-		fprintf(stderr, "RC522 init failed, code: %d (%s)\n",
-		        rc522_init_status, rc522_strerror(rc522_init_status));
+	/* команди, яким не потрібен зчитувач */
+	if (argc > 1 && strcmp(argv[1], "--list") == 0) {
+		cmd_list(&store);
+		card_store_free(&store);
+		return 0;
+	}
+	if (argc > 2 && strcmp(argv[1], "--remove") == 0) {
+		rc = cmd_remove(&store, db, argv[2]);
+		card_store_free(&store);
+		return rc;
+	}
+	if (argc > 1 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
+		usage(argv[0]);
+		card_store_free(&store);
+		return 0;
+	}
+
+	/* далі потрібен RC522 */
+	rc522_st = rc522_init(&rfid, RC522_SPI_DEV, 0, "/dev/gpiochip0", RC522_RST_GPIO_OFFSET);
+	if (rc522_st != RC522_OK) {
+		fprintf(stderr, "RC522 init failed, code: %d (%s)\n", rc522_st, rc522_strerror(rc522_st));
+		card_store_free(&store);
 		return 1;
 	}
 	printf("RC522: %s\n", rc522_version_name(rfid.version));
 
-	if (argc > 1 && strcmp(argv[1], "--copy") == 0) {
+	if (argc > 2 && strcmp(argv[1], "--enroll") == 0) {
+		rc = cmd_enroll(&rfid, &store, db, argv[2]);
+	} else if (argc > 1 && strcmp(argv[1], "--copy") == 0) {
 		copy_tool(&rfid);
-		rc522_deinit(&rfid);
-		return 0;
+		rc = 0;
+	} else if (argc > 1) {
+		usage(argv[0]);
+		rc = 2;
+	} else {
+		rc = access_control(&rfid, &store, db);
 	}
 
-	rc = access_control(&rfid);
-
 	rc522_deinit(&rfid);
+	card_store_free(&store);
 	return rc;
 }
