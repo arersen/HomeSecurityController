@@ -1,0 +1,22 @@
+# Raspberry Pi 5 — Home Security Controller
+# Необхідні зміни Device Tree для проєкту.
+#
+# На Raspberry Pi device tree формує firmware під час завантаження на основі
+# цього файлу (розділ /boot/firmware/). Рядки dtparam/dtoverlay — це і є
+# "необхідні зміни DT": вони вмикають потрібні вузли й створюють /dev/*.
+# Власний .dtbo-overlay НЕ потрібен, бо вся периферія стандартна.
+
+# --- SPI0 -> /dev/spidev0.0 : RFID RC522 ---
+dtparam=spi=on
+
+# --- I2C1 -> /dev/i2c-1 (GPIO2=SDA пін3, GPIO3=SCL пін5) : SHT3x ---
+dtparam=i2c_arm=on
+# за потреби понизити частоту шини (довгі дроти на бредборді):
+#dtparam=i2c_arm_baudrate=100000
+
+# GPIO для buzzer (GPIO17), radar (GPIO27), світлофора (GPIO22/23/26)
+# та RST RC522 (GPIO25) — це звичайні лінії, керуються з userspace через
+# libgpiod (/dev/gpiochip0 = RP1). Окремих змін DT не потребують.
+
+# Pi 5 за замовчуванням 64-bit; UART-консоль лишаємо на розсуд образу.
+#enable_uart=1
