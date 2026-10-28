@@ -12,6 +12,8 @@
 #include "traffic_light.h"
 #include "rc522.h"
 #include "card_store.h"
+#include "events.h"
+#include "logger.h"
 
 /* ---- Глобальні прапорці, якими керують сигнали ---- */
 static volatile sig_atomic_t g_running = 1;
@@ -68,6 +70,13 @@ static const char *cards_db_path(void)
 	return (p && *p) ? p : "/root/cards.db";
 }
 
+/* Шлях до журналу подій: змінна оточення або типовий. */
+static const char *log_file_path(void)
+{
+	const char *p = getenv("SECURITY_LOG");
+	return (p && *p) ? p : "/root/security.log";
+}
+
 static uint64_t now_ms(void)
 {
 	struct timespec ts;
@@ -100,19 +109,22 @@ static uint64_t now_ms(void)
 
 typedef enum { AC_LOCKED, AC_UNLOCKED, AC_PASSING } ac_state_t;
 
-static void maybe_reload(card_store_t *store, const char *db)
+static void maybe_reload(card_store_t *store, const char *db, event_queue_t *q)
 {
+	char detail[EVENT_DETAIL_MAX];
+
 	if (!g_reload)
 		return;
 	g_reload = 0;
-	if (card_store_load(store, db) == 0)
-		printf("[DB] перечитано: %zu карток\n", store->count);
-	else
-		fprintf(stderr, "[DB] помилка перечитування '%s'\n", db);
-	fflush(stdout);
+	if (card_store_load(store, db) == 0) {
+		snprintf(detail, sizeof(detail), "cards=%zu", store->count);
+		event_queue_emit(q, EV_DB_RELOAD, NULL, NULL, detail);
+	} else {
+		event_queue_emit(q, EV_ERROR, NULL, NULL, "db reload failed");
+	}
 }
 
-int access_control(rc522_t *rfid, card_store_t *store, const char *db)
+int access_control(rc522_t *rfid, card_store_t *store, const char *db, event_queue_t *q)
 {
 	gpio_t         buzzer_pin, radar;
 	traffic_light_t tl;
@@ -136,14 +148,16 @@ int access_control(rc522_t *rfid, card_store_t *store, const char *db)
 	buzzer_ctl_init(&buzzer, &buzzer_pin);
 
 	traffic_light_set(&tl, TL_RED);
-	printf("Access control ACTIVE (LOCKED). %zu карток у базі. Ctrl+C — стоп.\n",
-	       store->count);
-	fflush(stdout);
+	{
+		char detail[EVENT_DETAIL_MAX];
+		snprintf(detail, sizeof(detail), "cards=%zu state=LOCKED", store->count);
+		event_queue_emit(q, EV_STARTUP, NULL, NULL, detail);
+	}
 
 	while (g_running) {
 		uint64_t now = now_ms();
 
-		maybe_reload(store, db);
+		maybe_reload(store, db, q);
 		buzzer_ctl_tick(&buzzer, now);
 
 		switch (state) {
@@ -161,17 +175,16 @@ int access_control(rc522_t *rfid, card_store_t *store, const char *db)
 					intrusion_ts = 0;
 					rc522_uid_to_str(&card, uid, sizeof(uid));
 					if (who) {
-						printf("[ACCESS] GRANTED: %s (%s) -> UNLOCKED\n", who, uid);
+						event_queue_emit(q, EV_ACCESS_GRANTED, uid, who, NULL);
 						traffic_light_set(&tl, TL_GREEN);
 						buzzer_ctl_start(&buzzer, 1, AC_SHORT_BEEP_MS, 0, now);
 						unlock_ts = now;
 						state = AC_UNLOCKED;
 					} else {
-						printf("[ACCESS] DENIED: unknown card %s\n", uid);
+						event_queue_emit(q, EV_ACCESS_DENIED, uid, NULL, NULL);
 						buzzer_ctl_start(&buzzer, AC_DENY_BEEPS, AC_BEEP_ON_MS, AC_BEEP_OFF_MS, now);
 					}
 					rc522_halt(rfid);
-					fflush(stdout);
 				}
 			}
 
@@ -181,8 +194,7 @@ int access_control(rc522_t *rfid, card_store_t *store, const char *db)
 					if (intrusion_ts == 0) {
 						intrusion_ts = now;
 					} else if (now - intrusion_ts > AC_INTRUSION_MS) {
-						printf("[ALARM] INTRUSION: рух без картки!\n");
-						fflush(stdout);
+						event_queue_emit(q, EV_INTRUSION, NULL, NULL, "рух без картки");
 						buzzer_ctl_start(&buzzer, AC_DENY_BEEPS, AC_BEEP_ON_MS, AC_BEEP_OFF_MS, now);
 						intrusion_ts = now;   /* ре-арм, поки рух триває */
 					}
@@ -194,14 +206,12 @@ int access_control(rc522_t *rfid, card_store_t *store, const char *db)
 
 		case AC_UNLOCKED:
 			if (radar_read(&radar) == 1) {
-				printf("[ACCESS] passage started -> PASSING\n");
-				fflush(stdout);
+				event_queue_emit(q, EV_PASSAGE_START, NULL, NULL, NULL);
 				traffic_light_set(&tl, TL_YELLOW);
 				last_motion_ts = now;
 				state = AC_PASSING;
 			} else if (AC_UNLOCK_TIMEOUT_MS > 0 && now - unlock_ts > AC_UNLOCK_TIMEOUT_MS) {
-				printf("[ACCESS] nobody passed in time -> LOCKED\n");
-				fflush(stdout);
+				event_queue_emit(q, EV_UNLOCK_TIMEOUT, NULL, NULL, NULL);
 				traffic_light_set(&tl, TL_RED);
 				buzzer_ctl_start(&buzzer, 1, AC_SHORT_BEEP_MS, 0, now);
 				intrusion_ts = 0;
@@ -213,8 +223,7 @@ int access_control(rc522_t *rfid, card_store_t *store, const char *db)
 			if (radar_read(&radar) == 1)
 				last_motion_ts = now;
 			if (now - last_motion_ts > AC_MOTION_CLEAR_MS) {
-				printf("[ACCESS] passage complete -> LOCKED\n");
-				fflush(stdout);
+				event_queue_emit(q, EV_PASSAGE_END, NULL, NULL, NULL);
 				traffic_light_set(&tl, TL_RED);
 				buzzer_ctl_start(&buzzer, 1, AC_SHORT_BEEP_MS, 0, now);
 				intrusion_ts = 0;
@@ -227,7 +236,6 @@ int access_control(rc522_t *rfid, card_store_t *store, const char *db)
 		sleep_ms(AC_LOOP_MS);
 	}
 
-	printf("\nShutting down...\n");
 	buzzer_ctl_cancel(&buzzer);
 	traffic_light_set(&tl, TL_RED);
 	buzzer_deinit(&buzzer_pin);
@@ -487,7 +495,29 @@ int main(int argc, char** argv)
 		usage(argv[0]);
 		rc = 2;
 	} else {
-		rc = access_control(&rfid, &store, db);
+		/* контроль доступу: події йдуть у чергу, логер пише їх у журнал */
+		event_queue_t q;
+		logger_t      lg;
+
+		if (event_queue_init(&q, 256) != 0) {
+			fprintf(stderr, "не вдалося створити чергу подій\n");
+			rc522_deinit(&rfid);
+			card_store_free(&store);
+			return 1;
+		}
+		if (logger_start(&lg, &q, log_file_path(), 1) != 0) {
+			fprintf(stderr, "не вдалося запустити логер\n");
+			event_queue_destroy(&q);
+			rc522_deinit(&rfid);
+			card_store_free(&store);
+			return 1;
+		}
+
+		rc = access_control(&rfid, &store, db, &q);
+
+		event_queue_emit(&q, EV_SHUTDOWN, NULL, NULL, NULL);
+		logger_stop(&lg);           /* добере залишок черги й зупиниться */
+		event_queue_destroy(&q);
 	}
 
 	rc522_deinit(&rfid);
