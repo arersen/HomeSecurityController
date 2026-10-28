@@ -15,7 +15,7 @@ set(SOURCES
 		src/core/card_store.c
 		src/gpio/buzzer.c
 		src/i2c/i2c.c
-		src/i2c/bme680.c
+		src/i2c/sht3x.c
 		src/spi/spi.c
 		src/spi/rc522.c
 		src/gpio/gpio.c

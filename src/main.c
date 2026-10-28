@@ -14,6 +14,7 @@
 #include "card_store.h"
 #include "events.h"
 #include "logger.h"
+#include "sht3x.h"
 
 /* ---- Глобальні прапорці, якими керують сигнали ---- */
 static volatile sig_atomic_t g_running = 1;
@@ -106,6 +107,7 @@ static uint64_t now_ms(void)
 #define AC_MOTION_CLEAR_MS    1200    /* рух має зникнути на стільки -> прохід завершено */
 #define AC_UNLOCK_TIMEOUT_MS  15000   /* ніхто не пройшов -> знову блокуємо (0 = вимкнено) */
 #define AC_INTRUSION_MS       2000    /* рух без картки довше цього -> тривога (0 = вимкнено) */
+#define AC_SENSOR_INTERVAL_MS 60000   /* як часто читати SHT3x у журнал (0 = вимкнено) */
 
 typedef enum { AC_LOCKED, AC_UNLOCKED, AC_PASSING } ac_state_t;
 
@@ -129,8 +131,10 @@ int access_control(rc522_t *rfid, card_store_t *store, const char *db, event_que
 	gpio_t         buzzer_pin, radar;
 	traffic_light_t tl;
 	buzzer_ctl_t   buzzer;
+	sht3x_t        sensor;
+	int            have_sensor;
 	ac_state_t     state = AC_LOCKED;
-	uint64_t       unlock_ts = 0, last_motion_ts = 0, intrusion_ts = 0, last_card_poll = 0;
+	uint64_t       unlock_ts = 0, last_motion_ts = 0, intrusion_ts = 0, last_card_poll = 0, last_sensor = 0;
 	char           uid[RC522_UID_STR_LEN];
 
 	if (buzzer_init(&buzzer_pin, BUZZER_GPIO_OFFSET) != GPIO_OK)
@@ -147,18 +151,39 @@ int access_control(rc522_t *rfid, card_store_t *store, const char *db, event_que
 	}
 	buzzer_ctl_init(&buzzer, &buzzer_pin);
 
+	/* SHT3x необов'язковий: якщо його немає, демон працює далі без сенсора */
+	have_sensor = (sht3x_init(&sensor, I2C_BUS, SHT3X_I2C_ADDR) == 0);
+	if (!have_sensor)
+		event_queue_emit(q, EV_ERROR, NULL, NULL, "sht3x init failed (no I2C sensor?)");
+
 	traffic_light_set(&tl, TL_RED);
 	{
 		char detail[EVENT_DETAIL_MAX];
-		snprintf(detail, sizeof(detail), "cards=%zu state=LOCKED", store->count);
+		snprintf(detail, sizeof(detail), "cards=%zu sensor=%s state=LOCKED",
+		         store->count, have_sensor ? "yes" : "no");
 		event_queue_emit(q, EV_STARTUP, NULL, NULL, detail);
 	}
+	last_sensor = now_ms();   /* перше вимірювання — через інтервал */
 
 	while (g_running) {
 		uint64_t now = now_ms();
 
 		maybe_reload(store, db, q);
 		buzzer_ctl_tick(&buzzer, now);
+
+		/* періодичне вимірювання середовища -> у журнал */
+		if (have_sensor && AC_SENSOR_INTERVAL_MS > 0 &&
+		    now - last_sensor >= AC_SENSOR_INTERVAL_MS) {
+			float t, h;
+			last_sensor = now;
+			if (sht3x_read(&sensor, &t, &h) == 0) {
+				char d[EVENT_DETAIL_MAX];
+				snprintf(d, sizeof(d), "T=%.1fC RH=%.0f%%", (double)t, (double)h);
+				event_queue_emit(q, EV_SENSOR, NULL, NULL, d);
+			} else {
+				event_queue_emit(q, EV_ERROR, NULL, NULL, "sht3x read failed");
+			}
+		}
 
 		switch (state) {
 		case AC_LOCKED:
@@ -238,6 +263,8 @@ int access_control(rc522_t *rfid, card_store_t *store, const char *db, event_que
 
 	buzzer_ctl_cancel(&buzzer);
 	traffic_light_set(&tl, TL_RED);
+	if (have_sensor)
+		sht3x_deinit(&sensor);
 	buzzer_deinit(&buzzer_pin);
 	radar_deinit(&radar);
 	traffic_light_deinit(&tl);
@@ -305,6 +332,26 @@ static int cmd_remove(card_store_t *store, const char *db, const char *uid_str)
 	return 0;
 }
 
+static int cmd_sensor(void)
+{
+	sht3x_t s;
+	float t, h;
+
+	if (sht3x_init(&s, I2C_BUS, SHT3X_I2C_ADDR) != 0) {
+		fprintf(stderr, "sht3x: init failed on %s addr 0x%02X (перевір проводку/I2C)\n",
+		        I2C_BUS, SHT3X_I2C_ADDR);
+		return 1;
+	}
+	if (sht3x_read(&s, &t, &h) == 0) {
+		printf("SHT3x: T=%.2f C  RH=%.1f %%\n", (double)t, (double)h);
+		sht3x_deinit(&s);
+		return 0;
+	}
+	fprintf(stderr, "sht3x: read/CRC failed\n");
+	sht3x_deinit(&s);
+	return 1;
+}
+
 static void cmd_list(const card_store_t *store)
 {
 	char uid[CARD_UID_STRLEN];
@@ -324,9 +371,11 @@ static void usage(const char *prog)
 		"  %s --enroll \"Ім'я\" зареєструвати піднесену картку\n"
 		"  %s --remove <uid>  видалити картку (напр. 25:58:9F:E0)\n"
 		"  %s --list          показати список карток\n"
+		"  %s --sensor        разове читання SHT3x (T/RH)\n"
 		"  %s --copy          копіювати MIFARE (дані)\n"
-		"База карток: $SECURITY_CARDS_DB або /root/cards.db. SIGHUP перечитує її.\n",
-		prog, prog, prog, prog, prog);
+		"База карток: $SECURITY_CARDS_DB або /root/cards.db. SIGHUP перечитує її.\n"
+		"Журнал: $SECURITY_LOG або /root/security.log.\n",
+		prog, prog, prog, prog, prog, prog);
 }
 
 /* ============================================================
@@ -465,6 +514,11 @@ int main(int argc, char** argv)
 		cmd_list(&store);
 		card_store_free(&store);
 		return 0;
+	}
+	if (argc > 1 && strcmp(argv[1], "--sensor") == 0) {
+		rc = cmd_sensor();
+		card_store_free(&store);
+		return rc;
 	}
 	if (argc > 2 && strcmp(argv[1], "--remove") == 0) {
 		rc = cmd_remove(&store, db, argv[2]);
