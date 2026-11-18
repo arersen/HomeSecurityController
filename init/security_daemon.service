@@ -10,7 +10,11 @@ StartLimitBurst=5
 Type=simple
 # шляхи бази карток і журналу (демон їх читає зі змінних оточення)
 Environment=SECURITY_CARDS_DB=/etc/security_daemon/cards.db
-Environment=SECURITY_LOG=/var/log/security_daemon.log
+Environment=SECURITY_LOG=/var/lib/security_daemon/security.log
+# апаратний watchdog (/dev/watchdog). Якщо systemd сам тримає watchdog
+# (RuntimeWatchdogSec= у system.conf) — прибери цей рядок: пристрій один.
+Environment=SECURITY_WATCHDOG=/dev/watchdog
+StateDirectory=security_daemon
 ExecStart=/usr/bin/security_daemon
 # `systemctl reload security_daemon` -> SIGHUP -> перечитати базу карток без рестарту
 ExecReload=/bin/kill -HUP $MAINPID
@@ -26,7 +30,7 @@ TimeoutStopSec=5
 # DeviceAllow=/dev/spidev0.0 rw
 # DeviceAllow=/dev/gpiochip0 rw
 # ProtectSystem=strict
-# ReadWritePaths=/var/log /etc/security_daemon
+# ReadWritePaths=/var/lib/security_daemon /etc/security_daemon
 # NoNewPrivileges=yes
 
 [Install]

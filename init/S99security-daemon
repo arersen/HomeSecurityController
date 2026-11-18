@@ -1,19 +1,36 @@
 #!/bin/sh
 #
 # S99security-daemon — запуск Home Security Controller під BusyBox init.
-# Кладеться в /etc/init.d/ ; BusyBox rcS виконує S?? скрипти по порядку.
+# Кладеться в /etc/init.d/ ; BusyBox rcS виконує S?? скрипти по порядку,
+# тож S99 стартує останнім — після монтування ФС, мережі й драйверів.
 #
 
 DAEMON="security_daemon"
 DAEMON_PATH="/usr/bin/${DAEMON}"
 PIDFILE="/var/run/${DAEMON}.pid"
 
-# шляхи бази карток і журналу
+# шляхи бази карток і журналу (журнал — у /var/lib: у Buildroot /var/log -> /tmp,
+# тобто зникає після перезавантаження, а журнал безпеки має зберігатися)
 export SECURITY_CARDS_DB="/etc/security_daemon/cards.db"
-export SECURITY_LOG="/var/log/security_daemon.log"
+export SECURITY_LOG="/var/lib/security_daemon/security.log"
+# апаратний watchdog: завис/упав демон -> reboot -> цей скрипт знову його підніме
+export SECURITY_WATCHDOG="/dev/watchdog"
+
+# Годинник: у Pi 5 без батарейки RTC і без мережі час після старту = 1970.
+# Пробуємо RTC, далі (у фоні, якщо є мережа) NTP. Помилки не критичні.
+sync_clock() {
+	hwclock -s -u >/dev/null 2>&1
+	if command -v ntpd >/dev/null 2>&1; then
+		( ntpd -n -q -p pool.ntp.org >/dev/null 2>&1 && hwclock -w -u >/dev/null 2>&1 ) &
+	fi
+}
 
 start() {
 	printf 'Starting %s: ' "${DAEMON}"
+	[ -x "${DAEMON_PATH}" ] || { echo "FAIL (${DAEMON_PATH} not found)"; return 1; }
+	mkdir -p "$(dirname "${SECURITY_LOG}")" "$(dirname "${SECURITY_CARDS_DB}")"
+	[ -e "${SECURITY_WATCHDOG}" ] || unset SECURITY_WATCHDOG
+	sync_clock
 	# -b: демон foreground -> у фон; -m: створити pidfile; -x: виконуваний файл
 	start-stop-daemon -S -q -b -m -p "${PIDFILE}" -x "${DAEMON_PATH}"
 	if [ $? -eq 0 ]; then echo "OK"; else echo "FAIL"; fi
@@ -21,7 +38,7 @@ start() {
 
 stop() {
 	printf 'Stopping %s: ' "${DAEMON}"
-	# за замовчуванням шле SIGTERM -> демон коректно гасить GPIO
+	# SIGTERM -> демон гасить GPIO і робить magic close watchdog (без reboot)
 	start-stop-daemon -K -q -p "${PIDFILE}"
 	if [ $? -eq 0 ]; then echo "OK"; else echo "FAIL"; fi
 	rm -f "${PIDFILE}"
@@ -30,7 +47,16 @@ stop() {
 reload() {
 	printf 'Reloading %s (SIGHUP -> перечитати картки): ' "${DAEMON}"
 	start-stop-daemon -K -s HUP -q -p "${PIDFILE}"
-	echo "OK"
+	if [ $? -eq 0 ]; then echo "OK"; else echo "FAIL"; fi
+}
+
+status() {
+	if [ -f "${PIDFILE}" ] && kill -0 "$(cat "${PIDFILE}")" 2>/dev/null; then
+		echo "${DAEMON} is running (pid $(cat "${PIDFILE}"))"
+		return 0
+	fi
+	echo "${DAEMON} is stopped"
+	return 3
 }
 
 case "$1" in
@@ -38,8 +64,9 @@ case "$1" in
 	stop)    stop ;;
 	restart) stop; sleep 1; start ;;
 	reload)  reload ;;
+	status)  status ;;
 	*)
-		echo "Usage: $0 {start|stop|restart|reload}"
+		echo "Usage: $0 {start|stop|restart|reload|status}"
 		exit 1
 		;;
 esac

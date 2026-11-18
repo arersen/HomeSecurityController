@@ -15,6 +15,7 @@
 #include "events.h"
 #include "logger.h"
 #include "sht3x.h"
+#include "watchdog.h"
 
 /* ---- Глобальні прапорці, якими керують сигнали ---- */
 static volatile sig_atomic_t g_running = 1;
@@ -37,8 +38,8 @@ static void install_signals(void)
 	sigaction(SIGHUP, &hup, NULL);
 }
 
-__attribute__((constructor)) void setup(void) {
-	printf("setup\n");
+__attribute__((constructor)) static void setup(void)
+{
 	check_pins_or_die();
 }
 
@@ -68,14 +69,14 @@ void *animation(void *args)
 static const char *cards_db_path(void)
 {
 	const char *p = getenv("SECURITY_CARDS_DB");
-	return (p && *p) ? p : "/root/cards.db";
+	return (p && *p) ? p : "/etc/security_daemon/cards.db";
 }
 
 /* Шлях до журналу подій: змінна оточення або типовий. */
 static const char *log_file_path(void)
 {
 	const char *p = getenv("SECURITY_LOG");
-	return (p && *p) ? p : "/root/security.log";
+	return (p && *p) ? p : "/var/lib/security_daemon/security.log";
 }
 
 static uint64_t now_ms(void)
@@ -108,6 +109,8 @@ static uint64_t now_ms(void)
 #define AC_UNLOCK_TIMEOUT_MS  15000   /* ніхто не пройшов -> знову блокуємо (0 = вимкнено) */
 #define AC_INTRUSION_MS       2000    /* рух без картки довше цього -> тривога (0 = вимкнено) */
 #define AC_SENSOR_INTERVAL_MS 60000   /* як часто читати SHT3x у журнал (0 = вимкнено) */
+#define AC_WDT_TIMEOUT_S      10      /* апаратний watchdog: без «годування» стільки секунд -> reboot */
+#define AC_WDT_KICK_MS        1000    /* як часто годувати watchdog з головного циклу */
 
 typedef enum { AC_LOCKED, AC_UNLOCKED, AC_PASSING } ac_state_t;
 
@@ -128,13 +131,14 @@ static void maybe_reload(card_store_t *store, const char *db, event_queue_t *q)
 
 int access_control(rc522_t *rfid, card_store_t *store, const char *db, event_queue_t *q)
 {
+	watchdog_t     wdt;
 	gpio_t         buzzer_pin, radar;
 	traffic_light_t tl;
 	buzzer_ctl_t   buzzer;
 	sht3x_t        sensor;
 	int            have_sensor;
 	ac_state_t     state = AC_LOCKED;
-	uint64_t       unlock_ts = 0, last_motion_ts = 0, intrusion_ts = 0, last_card_poll = 0, last_sensor = 0;
+	uint64_t       unlock_ts = 0, last_motion_ts = 0, intrusion_ts = 0, last_card_poll = 0, last_sensor = 0, last_kick = 0;
 	char           uid[RC522_UID_STR_LEN];
 
 	if (buzzer_init(&buzzer_pin, BUZZER_GPIO_OFFSET) != GPIO_OK)
@@ -156,17 +160,37 @@ int access_control(rc522_t *rfid, card_store_t *store, const char *db, event_que
 	if (!have_sensor)
 		event_queue_emit(q, EV_ERROR, NULL, NULL, "sht3x init failed (no I2C sensor?)");
 
+	/* watchdog — останнім, коли вся периферія вже піднялась */
+	{
+		const char *wdev = watchdog_path_from_env();
+
+		if (wdev && watchdog_open(&wdt, wdev, AC_WDT_TIMEOUT_S) != 0)
+			event_queue_emit(q, EV_ERROR, NULL, NULL, "watchdog open failed");
+		else if (!wdev)
+			wdt.fd = -1;
+	}
+
 	traffic_light_set(&tl, TL_RED);
 	{
 		char detail[EVENT_DETAIL_MAX];
-		snprintf(detail, sizeof(detail), "cards=%zu sensor=%s state=LOCKED",
-		         store->count, have_sensor ? "yes" : "no");
+		char wd[16] = "off";
+
+		if (wdt.fd >= 0)
+			snprintf(wd, sizeof(wd), "%ds", wdt.timeout_s);
+		snprintf(detail, sizeof(detail), "cards=%zu sensor=%s wdt=%s state=LOCKED",
+		         store->count, have_sensor ? "yes" : "no", wd);
 		event_queue_emit(q, EV_STARTUP, NULL, NULL, detail);
 	}
 	last_sensor = now_ms();   /* перше вимірювання — через інтервал */
 
 	while (g_running) {
 		uint64_t now = now_ms();
+
+		/* «живий» головний цикл = годуємо watchdog; завис цикл -> reboot */
+		if (now - last_kick >= AC_WDT_KICK_MS) {
+			watchdog_kick(&wdt);
+			last_kick = now;
+		}
 
 		maybe_reload(store, db, q);
 		buzzer_ctl_tick(&buzzer, now);
@@ -261,6 +285,7 @@ int access_control(rc522_t *rfid, card_store_t *store, const char *db, event_que
 		sleep_ms(AC_LOOP_MS);
 	}
 
+	watchdog_close(&wdt);          /* коректна зупинка: magic close, без reboot */
 	buzzer_ctl_cancel(&buzzer);
 	traffic_light_set(&tl, TL_RED);
 	if (have_sensor)
@@ -373,8 +398,9 @@ static void usage(const char *prog)
 		"  %s --list          показати список карток\n"
 		"  %s --sensor        разове читання SHT3x (T/RH)\n"
 		"  %s --copy          копіювати MIFARE (дані)\n"
-		"База карток: $SECURITY_CARDS_DB або /root/cards.db. SIGHUP перечитує її.\n"
-		"Журнал: $SECURITY_LOG або /root/security.log.\n",
+		"База карток: $SECURITY_CARDS_DB або /etc/security_daemon/cards.db. SIGHUP перечитує її.\n"
+		"Журнал: $SECURITY_LOG або /var/lib/security_daemon/security.log.\n"
+		"Watchdog: SECURITY_WATCHDOG=1 (/dev/watchdog) — вмикає init-скрипт.\n",
 		prog, prog, prog, prog, prog, prog);
 }
 

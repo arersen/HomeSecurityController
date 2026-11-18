@@ -4,7 +4,7 @@
 (радар RCWL/GPIO), сигналізація (buzzer), індикація (світлофор), середовище
 (SHT3x/I2C), журнал подій через чергу + окремий потік-логер.
 
-> 
+> Позначки `<...>` заміни на свої значення (defconfig, пристрій SD, IP плати).
 
 ---
 
@@ -74,11 +74,12 @@ bootloader/firmware Pi 5). Тому за основу взято **Raspberry Pi 
 3. Прибрати зайве від Pi OS Lite.
 4. Додати параметри інтерфейсів у `config.txt` (див. крок 3).
 
-> Коренева ФС лишається тією, що на картці. Перевірити, яка саме:
-> ```sh
-> cat /etc/os-release      # "Buildroot ..." -> корінь Buildroot; "Debian ..." -> Pi OS Lite
-> cat /proc/1/comm         # init (BusyBox) -> Buildroot; systemd -> Pi OS
-> ```
+> Підтверджено на цьому проєкті (`cat /etc/os-release` → `NAME=Buildroot`,
+> `cat /proc/1/comm` → `init`, `apt` відсутній): коренева ФС — **Buildroot**,
+> init — **BusyBox**. Тобто образ **повністю власний: ядро + userland Buildroot**,
+> а від Raspberry Pi OS Lite використано лише boot-розділ (firmware/bootloader Pi 5).
+> Наслідок для сервісу: init — BusyBox, тож запуск ставиться скриптом
+> `init/S99security-daemon` (а не systemd-юнітом).
 
 
 ---
@@ -128,19 +129,26 @@ file cmake-build-buildroot/security_daemon   # має бути ELF ... ARM aarch
 
 ## 5. Деплой і запуск
 
-IP плати задається в CMake (`DEPLOY_HOST`, зараз `192.168.137.127`) або з ключем:
+IP плати задається в CMake (`DEPLOY_HOST`, зараз `192.168.137.127`) або з ключем.
+Уся логіка — у `scripts/deploy.sh` (потрібен SSH-доступ root по ключу):
+
 ```sh
-cmake --build cmake-build-buildroot --target deploy        # зібрати + залити (scp -O)
-cmake --build cmake-build-buildroot --target run           # залити + запустити, вивід сюди
+cmake --build cmake-build-buildroot --target deploy   # встановити як сервіс і запустити
+cmake --build cmake-build-buildroot --target logs     # журнал подій з плати (tail -f)
+cmake --build cmake-build-buildroot --target run      # демон у цьому терміналі (налагодження)
 # або точковий IP:
 cmake -DDEPLOY_HOST=<ip> -S . -B cmake-build-buildroot
 ```
 
-Вручну:
-```sh
-scp -O cmake-build-buildroot/security_daemon root@<ip>:/usr/bin/
-ssh root@<ip> /usr/bin/security_daemon
-```
+Що робить `deploy`:
+1. зупиняє сервіс; кладе `/usr/bin/security_daemon` і `/etc/init.d/S99security-daemon` (автозапуск);
+2. копіює libgpiod із sysroot Buildroot у `/usr/lib` — запуск без `LD_LIBRARY_PATH`
+   (вимкнути: `-DDEPLOY_LIBGPIOD=OFF`, якщо libgpiod уже є в rootfs);
+3. виставляє на платі час із хоста й пише його в RTC — у журналі реальні дати, а не 1970;
+4. створює `/etc/security_daemon/cards.db` (0600; переносить стару `/root/cards.db`, якщо є)
+   і `/var/lib/security_daemon/`; стартує сервіс і показує `status`.
+
+Вручну те саме: `sh scripts/deploy.sh root@<ip> cmake-build-buildroot/security_daemon [libgpiod.so.X.Y.Z]`.
 
 Як сервіс (автозапуск) — див. **`init/README.md`** (systemd unit або BusyBox S99-скрипт).
 
@@ -150,19 +158,37 @@ ssh root@<ip> /usr/bin/security_daemon
 
 ```sh
 security_daemon --sensor              # разове T/RH з SHT3x
+/etc/init.d/S99security-daemon stop   # --enroll/--copy потребують зчитувача: спершу зупинити сервіс
 security_daemon --enroll "Arsen"      # піднести картку -> у базу
+/etc/init.d/S99security-daemon start
 security_daemon --list                # перелік дозволених карток
 security_daemon                       # контроль доступу
 
 # журнал подій:
-tail -f /var/log/security_daemon.log          # BusyBox
+tail -f /var/lib/security_daemon/security.log  # BusyBox
+/etc/init.d/S99security-daemon reload        # SIGHUP -> перечитати картки (BusyBox)
 journalctl -u security_daemon -f              # systemd
 systemctl reload security_daemon              # SIGHUP -> перечитати картки
 ```
 
 Сценарії для демонстрації: GRANTED (зелений+1 біп) → рух (жовтий) → прохід (червоний+біп);
 невідома картка (10 біпів); рух без картки (тривога); `--enroll`/`--remove`;
-`reload`; періодичний `[SENSOR]` у журналі.
+`reload`; періодичний `[SENSOR]` у журналі; автостарт після reboot; watchdog.
+Покроковий сценарій із таймінгами — **`docs/DEMO.md`**.
+
+---
+
+## 6a. Образ прошивки для здачі (GitHub Release)
+
+```sh
+# boot-розділ (FAT) + rootfs Buildroot:
+#   Image, bcm2712-rpi-5-b.dtb, config.txt, cmdline.txt, overlays/  +  output/images/rootfs.ext4
+# або весь SD одним файлом (на Linux):  sudo dd if=/dev/sdX of=hsc-pi5.img bs=4M status=progress
+xz -T0 hsc-pi5.img
+```
+
+> **Перед публікацією** прибери з boot-розділу `user-data` і `network-config` (лишились від
+> Raspberry Pi Imager): там Wi‑Fi пароль і хеш пароля користувача. Buildroot їх не використовує.
 
 ---
 

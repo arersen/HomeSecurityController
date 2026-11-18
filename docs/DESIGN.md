@@ -1,6 +1,6 @@
 # Design Document — Home Security Controller (Raspberry Pi 5)
 
-**Автор:** <твоє ім'я> · **Репозиторій:** HomeSecurityController · **Платформа:** Raspberry Pi 5 (aarch64), власний образ Linux (Buildroot)
+**Автор:** Arsen · **Репозиторій:** HomeSecurityController · **Платформа:** Raspberry Pi 5 (aarch64), власний образ Linux (Buildroot)
 
 ---
 
@@ -30,6 +30,10 @@
 | Buzzer (через транзистор) | GPIO | 11 | GPIO17 |
 | Радар RCWL-0516 | GPIO | 13 | GPIO27 |
 | Світлофор R/G/Y | GPIO | 15 / 16 / 37 | GPIO22 / 23 / 26 |
+
+**Сенсор середовища.** ТЗ пропонує BME680 або ENS160+AHT21; у проєкті використано **SHT3x** —
+той самий інтерфейс (I2C) і та сама роль у системі (T/RH у журнал). BME680 сідає на ту саму
+шину (адреса 0x76/0x77) і додав би тиск і якість повітря — див. розд. 11.
 
 RC522 і SHT3x живляться від 3.3 V. GPIO керуються з userspace через **libgpiod v1**
 (`/dev/gpiochip0` = контролер RP1 на Pi 5). Повна схема — у EasyEDA.
@@ -67,6 +71,7 @@ RC522 і SHT3x живляться від 3.3 V. GPIO керуються з users
 | `core/card_store` | Перепустки у файлі (load/save атомарно, enroll/remove) |
 | `core/events` | Черга подій (producer/consumer) |
 | `core/logger` | Потік-споживач → журнал |
+| `core/watchdog` | Апаратний watchdog (`/dev/watchdog`): kick з головного циклу, magic close |
 | `core/board_config` | Піни, шини, перевірка колізій |
 | `main` | Автомат доступу + CLI |
 
@@ -98,13 +103,19 @@ RC522 і SHT3x живляться від 3.3 V. GPIO керуються з users
 
 Кожна подія — рядок: `2026-10-28T14:00:41Z [GRANTED] uid=25:58:9F:E0 name="Guest"`.
 Типи: STARTUP, GRANTED, DENIED, INTRUSION, PASSAGE_START/END, UNLOCK_TIMEOUT,
-DB_RELOAD, SENSOR, ERROR. Призначення — файл (`/var/log/security_daemon.log`) та
+DB_RELOAD, SENSOR, ERROR. Призначення — файл (`/var/lib/security_daemon/security.log`) та
 stdout (під systemd → journald; під BusyBox — файл).
+
+- Журнал саме в `/var/lib`, бо у Buildroot `/var/log` — symlink на `/tmp` (tmpfs), і журнал
+  безпеки зникав би після перезавантаження.
+- **Час.** У Pi 5 без батарейки RTC і без мережі годинник стартує з 1970-01-01. Тому `deploy`
+  виставляє час із хоста й пише його в RTC (`hwclock -w`), а init-скрипт при старті читає RTC
+  (`hwclock -s`) і, якщо є мережа, підтягує NTP (BusyBox `ntpd -q`).
 
 ## 8. Перепустки та безпека
 
 - Список дозволених UID — у файлі (`/etc/security_daemon/cards.db`), атомарний
-  запис (tmp+rename), права `0600`. Команди `--enroll`/`--remove`/`--list`.
+  запис (tmp+rename), права `0600`, тека `0700` (лише root). Команди `--enroll`/`--remove`/`--list`.
 - **Гаряче перечитування** по `SIGHUP` — без перезапуску сервісу.
 - Обмеження (чесно): UID MIFARE клонується «magic»-картками, а телефони дають
   випадковий UID. Для реального доступу надійніше перевіряти секрет у секторі
@@ -118,18 +129,25 @@ stdout (під systemd → journald; під BusyBox — файл).
   а ядро підставлено від Buildroot (`Image`, `kernel=Image` у `config.txt`).
 - **Зміни Device Tree**: `dtparam=spi=on`, `dtparam=i2c_arm=on` (вмикають
   `/dev/spidev0.0` та `/dev/i2c-1`). Власний `.dtbo` не потрібен — периферія стандартна.
-- **Сервіс**: init = BusyBox → `init/S99security-daemon` (автозапуск через `rcS`).
-  Для systemd-образу є еквівалентний `security_daemon.service`.
+- **Сервіс**: init = BusyBox → `init/S99security-daemon` (автозапуск через `rcS`;
+  `start|stop|restart|reload|status`). Для systemd-образу є еквівалентний `security_daemon.service`.
+- **Watchdog** (`core/watchdog`): демон відкриває `/dev/watchdog` (драйвер `bcm2835-wdt`, таймаут
+  10 с) і годує його раз на секунду з головного циклу. Якщо цикл завис або процес упав —
+  таймер SoC перезавантажує плату, і `S99` знову піднімає сервіс (самовідновлення).
+  Коректна зупинка (`SIGTERM`) робить magic close (`'V'`), тож `stop` плату не перезавантажує.
+  Вмикається змінною `SECURITY_WATCHDOG` (її ставить init-скрипт), тому ручний запуск для
+  налагодження watchdog не чіпає. Подія `STARTUP` показує `wdt=10s`.
 
 ## 10. Збірка та розгортання
 
-Крос-компіляція CMake із Buildroot-тулчейном, деплой на плату по SSH
-(`scp -O`, таргети `deploy`/`run`). Детально — `docs/BUILD.md`.
+Крос-компіляція CMake із Buildroot-тулчейном. Деплой — `scripts/deploy.sh` (таргет `deploy`):
+бінарник у `/usr/bin`, init-скрипт у `/etc/init.d`, libgpiod із sysroot у `/usr/lib`
+(без `LD_LIBRARY_PATH`), синхронізація часу, старт сервісу. `run` — те саме, але демон у
+терміналі; `logs` — `tail -f` журналу. Детально — `docs/BUILD.md`.
 
 ## 11. Обмеження та подальший розвиток
 
 - Аутентифікація за UID (див. розд. 8) — перехід на перевірку сектора під ключем.
-- Watchdog: під'єднати апаратний watchdog Pi для самовідновлення демона.
 - Винести конфіг (піни, інтервали) у файл замість `board_config.h`.
 - BME680/ENS160 замість SHT3x дало б ще й якість повітря/тиск.
 
@@ -144,8 +162,9 @@ stdout (під systemd → journald; під BusyBox — файл).
 | Журнал подій | event queue + logger (розд. 6–7) |
 | Сигналізація | buzzer-FSM: відмова, тривога (розд. 5) |
 | daemon / event queue / logging | розд. 4, 6, 7 |
+| Watchdog (контр. питання) | `/dev/watchdog` + magic close (розд. 9) |
 
 **Контрольні питання** (готовність до захисту): Systemd / BusyBox init, SPI, Device
 Tree (dtparam), GPIO (libgpiod/RP1), IPC (mutex+condvar черга), Cross compile
 (Buildroot toolchain), Linux permissions (cards.db 0600), Boot process (firmware
-Pi → kernel Buildroot), Kernel modules (spidev, i2c-dev), Watchdog (розд. 11).
+Pi → kernel Buildroot), Kernel modules (spidev, i2c-dev), Watchdog (розд. 9).

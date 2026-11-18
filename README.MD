@@ -27,17 +27,20 @@ security_daemon --list          перелік карток
 security_daemon --sensor        разове читання SHT3x
 security_daemon --copy          копіювання даних MIFARE
 ```
-База карток: `$SECURITY_CARDS_DB` або `/root/cards.db`. Журнал: `$SECURITY_LOG` або `/root/security.log`.
+База карток: `$SECURITY_CARDS_DB` або `/etc/security_daemon/cards.db` (0600).
+Журнал: `$SECURITY_LOG` або `/var/lib/security_daemon/security.log`.
+Апаратний watchdog: `SECURITY_WATCHDOG=/dev/watchdog` (вмикає init-скрипт).
 
 ## Структура
 ```
 include/        заголовки
-src/core/       events (черга), logger, card_store, board_config
+src/core/       events (черга), logger, card_store, watchdog
 src/gpio/        gpio, buzzer, radar, traffic_light
 src/i2c/         i2c, sht3x
 src/spi/         rc522
 init/            systemd unit + BusyBox init-скрипт (запуск сервісу)
-docs/            BUILD.md (інструкції збірки), config.txt (зміни Device Tree)
+scripts/         deploy.sh (встановлення на плату як сервіс)
+docs/            DESIGN.md, BUILD.md, DEMO.md (сценарій демо), config.txt (зміни DT), схема (PDF)
 ```
 
 ## Збірка та запуск
@@ -46,5 +49,7 @@ docs/            BUILD.md (інструкції збірки), config.txt (зм�
 Коротко:
 ```sh
 cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=<buildroot>/output/host/share/buildroot/toolchainfile.cmake
-cmake --build build --target run      # зібрати, залити на плату, запустити
+cmake --build build --target deploy   # зібрати, встановити як сервіс, синхронізувати час, запустити
+cmake --build build --target logs     # журнал подій з плати в реальному часі
+cmake --build build --target run      # те саме, але демон у терміналі (налагодження)
 ```
