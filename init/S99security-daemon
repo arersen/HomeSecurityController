@@ -13,6 +13,7 @@ PIDFILE="/var/run/${DAEMON}.pid"
 # тобто зникає після перезавантаження, а журнал безпеки має зберігатися)
 export SECURITY_CARDS_DB="/etc/security_daemon/cards.db"
 export SECURITY_LOG="/var/lib/security_daemon/security.log"
+STDERR_LOG="/var/lib/security_daemon/stderr.log"
 # апаратний watchdog: завис/упав демон -> reboot -> цей скрипт знову його підніме
 export SECURITY_WATCHDOG="/dev/watchdog"
 
@@ -31,8 +32,10 @@ start() {
 	mkdir -p "$(dirname "${SECURITY_LOG}")" "$(dirname "${SECURITY_CARDS_DB}")"
 	[ -e "${SECURITY_WATCHDOG}" ] || unset SECURITY_WATCHDOG
 	sync_clock
-	# -b: демон foreground -> у фон; -m: створити pidfile; -x: виконуваний файл
-	start-stop-daemon -S -q -b -m -p "${PIDFILE}" -x "${DAEMON_PATH}"
+	# -b: демон foreground -> у фон; -m: створити pidfile. Через sh -c exec PID той самий,
+	# а stderr (помилки старту, яких ще нема в журналі) іде у файл, не в /dev/null.
+	start-stop-daemon -S -q -b -m -p "${PIDFILE}" -x /bin/sh -- \
+		-c "exec ${DAEMON_PATH} >/dev/null 2>>${STDERR_LOG}"
 	if [ $? -eq 0 ]; then echo "OK"; else echo "FAIL"; fi
 }
 

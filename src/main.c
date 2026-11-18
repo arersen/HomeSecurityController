@@ -111,6 +111,7 @@ static uint64_t now_ms(void)
 #define AC_SENSOR_INTERVAL_MS 60000   /* як часто читати SHT3x у журнал (0 = вимкнено) */
 #define AC_WDT_TIMEOUT_S      10      /* апаратний watchdog: без «годування» стільки секунд -> reboot */
 #define AC_WDT_KICK_MS        1000    /* як часто годувати watchdog з головного циклу */
+#define AC_RC522_RETRY_MS     5000    /* сервіс без зчитувача: повторна спроба init */
 
 typedef enum { AC_LOCKED, AC_UNLOCKED, AC_PASSING } ac_state_t;
 
@@ -528,6 +529,9 @@ int main(int argc, char** argv)
 	card_store_t  store;
 	rc522_t       rfid;
 	rc522_status_t rc522_st;
+	event_queue_t  q;
+	logger_t       lg;
+	int            service = 0;
 	int rc;
 
 	install_signals();
@@ -557,10 +561,44 @@ int main(int argc, char** argv)
 		return 0;
 	}
 
+	/* режим сервісу: черга й логер стартують ДО периферії, щоб помилки
+	 * ініціалізації потрапили в журнал, а не зникли разом із процесом */
+	if (argc == 1) {
+		if (event_queue_init(&q, 256) != 0) {
+			fprintf(stderr, "не вдалося створити чергу подій\n");
+			card_store_free(&store);
+			return 1;
+		}
+		if (logger_start(&lg, &q, log_file_path(), 1) != 0) {
+			fprintf(stderr, "не вдалося запустити логер\n");
+			event_queue_destroy(&q);
+			card_store_free(&store);
+			return 1;
+		}
+		service = 1;
+	}
+
 	/* далі потрібен RC522 */
 	rc522_st = rc522_init(&rfid, RC522_SPI_DEV, 0, "/dev/gpiochip0", RC522_RST_GPIO_OFFSET);
+	if (rc522_st != RC522_OK && service) {
+		/* сервіс не падає без зчитувача: фіксуємо помилку й чекаємо, поки
+		 * його під'єднають (повтор кожні AC_RC522_RETRY_MS) */
+		char d[EVENT_DETAIL_MAX];
+
+		snprintf(d, sizeof(d), "rc522: %s; retry", rc522_strerror(rc522_st));
+		event_queue_emit(&q, EV_ERROR, NULL, NULL, d);
+		while (g_running && rc522_st != RC522_OK) {
+			sleep_ms(AC_RC522_RETRY_MS);
+			rc522_st = rc522_init(&rfid, RC522_SPI_DEV, 0, "/dev/gpiochip0", RC522_RST_GPIO_OFFSET);
+		}
+	}
 	if (rc522_st != RC522_OK) {
 		fprintf(stderr, "RC522 init failed, code: %d (%s)\n", rc522_st, rc522_strerror(rc522_st));
+		if (service) {
+			event_queue_emit(&q, EV_SHUTDOWN, NULL, NULL, NULL);
+			logger_stop(&lg);
+			event_queue_destroy(&q);
+		}
 		card_store_free(&store);
 		return 1;
 	}
@@ -575,24 +613,8 @@ int main(int argc, char** argv)
 		usage(argv[0]);
 		rc = 2;
 	} else {
-		/* контроль доступу: події йдуть у чергу, логер пише їх у журнал */
-		event_queue_t q;
-		logger_t      lg;
-
-		if (event_queue_init(&q, 256) != 0) {
-			fprintf(stderr, "не вдалося створити чергу подій\n");
-			rc522_deinit(&rfid);
-			card_store_free(&store);
-			return 1;
-		}
-		if (logger_start(&lg, &q, log_file_path(), 1) != 0) {
-			fprintf(stderr, "не вдалося запустити логер\n");
-			event_queue_destroy(&q);
-			rc522_deinit(&rfid);
-			card_store_free(&store);
-			return 1;
-		}
-
+		/* контроль доступу: події йдуть у чергу, логер пише їх у журнал
+		 * (черга й логер уже запущені вище) */
 		rc = access_control(&rfid, &store, db, &q);
 
 		event_queue_emit(&q, EV_SHUTDOWN, NULL, NULL, NULL);
