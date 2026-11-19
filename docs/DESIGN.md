@@ -123,10 +123,15 @@ stdout (під systemd → journald; під BusyBox — файл).
 
 ## 9. Linux-частина
 
-- **Власний образ**: ядро + userland **Buildroot** (`NAME=Buildroot`, init — BusyBox).
-- **Boot**: чистий `sdcard.img` Buildroot на Pi 5 не завантажувався, тому за основу
-  взято boot-розділ **Raspberry Pi OS Lite** (надійний firmware/bootloader Pi 5),
-  а ядро підставлено від Buildroot (`Image`, `kernel=Image` у `config.txt`).
+- **Власний образ**: ядро + userland **Buildroot** 2026.08 (`NAME=Buildroot`, init — BusyBox).
+- **Картка**: записано `sdcard.img` Buildroot — розмітка genimage: p1 FAT 32 МБ (boot),
+  p2 ext4 120 МБ (**rootfs Buildroot**, `root=/dev/mmcblk0p2`). Додатково p3 `data`.
+- **Boot**: з власними boot-файлами Buildroot Pi 5 не стартував, тому **вміст FAT-розділу**
+  замінено файлами з Raspberry Pi OS Lite (`bcm2712*.dtb`, `overlays/`, `config.txt`), ядро
+  Pi OS прибрано, покладено `Image` від Buildroot (`kernel=Image` у `config.txt`),
+  `cmdline.txt` вказує на p2. Ланцюжок: EEPROM-bootloader Pi 5 → `config.txt` → `Image`
+  (Buildroot) + `bcm2712-rpi-5-b.dtb` → rootfs Buildroot → BusyBox init.
+  Перевірка — `docs/BUILD.md`, розд. 1.3.
 - **Зміни Device Tree**: `dtparam=spi=on`, `dtparam=i2c_arm=on` (вмикають
   `/dev/spidev0.0` та `/dev/i2c-1`). Власний `.dtbo` не потрібен — периферія стандартна.
 - **Сервіс**: init = BusyBox → `init/S99security-daemon` (автозапуск через `rcS`;
@@ -150,12 +155,14 @@ stdout (під systemd → journald; під BusyBox — файл).
 - Аутентифікація за UID (див. розд. 8) — перехід на перевірку сектора під ключем.
 - Винести конфіг (піни, інтервали) у файл замість `board_config.h`.
 - BME680/ENS160 замість SHT3x дало б ще й якість повітря/тиск.
+- Boot-файли Pi 5 (dtb/overlays/config) брати з пакета `rpi-firmware` Buildroot через
+  post-image скрипт, щоб `sdcard.img` вантажився без ручної заміни FAT-розділу.
 
 ## 12. Відповідність ТЗ
 
 | Вимога | Реалізація |
 |---|---|
-| Власний образ Linux | ядро+rootfs Buildroot, boot через firmware Pi (розд. 9) |
+| Власний образ Linux | ядро + rootfs Buildroot (розмітка `sdcard.img`), dtb/config на FAT — з Pi OS Lite (розд. 9) |
 | Запуск як сервіс | BusyBox init-скрипт / systemd-юніт |
 | 2–3 інтерфейси | SPI + I2C + GPIO (розд. 3) |
 | Контроль присутності | радар + автомат станів (розд. 5) |
@@ -166,5 +173,5 @@ stdout (під systemd → journald; під BusyBox — файл).
 
 **Контрольні питання** (готовність до захисту): Systemd / BusyBox init, SPI, Device
 Tree (dtparam), GPIO (libgpiod/RP1), IPC (mutex+condvar черга), Cross compile
-(Buildroot toolchain), Linux permissions (cards.db 0600), Boot process (firmware
-Pi → kernel Buildroot), Kernel modules (spidev, i2c-dev), Watchdog (розд. 9).
+(Buildroot toolchain), Linux permissions (cards.db 0600), Boot process (EEPROM Pi 5
+→ config.txt → kernel Buildroot → rootfs Buildroot), Kernel modules (spidev, i2c-dev), Watchdog (розд. 9).

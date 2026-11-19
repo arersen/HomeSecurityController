@@ -48,39 +48,66 @@ make menuconfig
 ### 1.2. Збірка
 ```sh
 make -j"$(nproc)"
-# результат:
-#   output/images/Image        ядро (arm64)
-#   output/images/*.dtb         device tree
-#   output/host/                крос-тулчейн
-#   output/target/ , rootfs.*   коренева ФС
+# результат (output/images/):
+#   Image          ядро (arm64) — лише ядро, rootfs у ньому НЕМА
+#   *.dtb          device tree
+#   rootfs.ext4    образ кореневої ФС (зібраний з output/target/)
+#   boot.vfat      образ FAT-розділу
+#   sdcard.img     уся картка: p1 = boot.vfat, p2 = rootfs.ext4 (genimage)
+# output/host/     крос-тулчейн
 ```
 
-### 1.3. Складання завантажувальної картки (Pi OS boot + ядро Buildroot)
+### 1.3. Складання завантажувальної картки (розмітка й rootfs Buildroot + boot-файли Pi OS Lite)
 
-Чистий `sdcard.img` від Buildroot на Raspberry Pi 5 **не завантажувався** (капризний
-bootloader/firmware Pi 5). Тому за основу взято **Raspberry Pi OS Lite** — у нього
-надійний boot на Pi 5 — а від Buildroot підставлено лише **ядро**:
+Чистий `sdcard.img` від Buildroot на Raspberry Pi 5 **не завантажувався** з власними
+boot-файлами. Тому розмітку й кореневу ФС взято від Buildroot, а **вміст FAT-розділу**
+замінено файлами з Raspberry Pi OS Lite (dtb/overlays/config, з якими Pi 5 стабільно
+стартує), і на нього покладено ядро Buildroot:
 
-1. Записати Raspberry Pi OS Lite на SD (Raspberry Pi Imager).
-2. Підставити ядро Buildroot на boot-розділ:
+1. Записати `output/images/sdcard.img` на SD-картку:
    ```sh
-   cp ~/ajax_project/buildroot/output/images/Image  /media/<user>/bootfs/
+   sudo dd if=output/images/sdcard.img of=/dev/sdX bs=4M conv=fsync status=progress
    ```
-   У `config.txt` вказати це ядро (Pi 5 типово шукає `kernel_2712.img`):
+   Отримуємо: **p1** — FAT 32 МБ (boot), **p2** — ext4 120 МБ (**rootfs Buildroot**).
+2. Взяти boot-файли Raspberry Pi OS Lite (образ, записаний Raspberry Pi Imager):
+   `bcm2712*.dtb`, `overlays/`, `config.txt`, `cmdline.txt` (+ `start.elf`, `fixup*.dat`,
+   `bootcode.bin` — Pi 5 їх не використовує, лишились при копіюванні).
+3. Замінити ними вміст p1 картки Buildroot. Ядро Pi OS (`kernel_2712.img`, `kernel8.img`,
+   initramfs) — **прибрати**.
+4. Покласти ядро Buildroot і вказати його в `config.txt` (Pi 5 типово шукає `kernel_2712.img`):
+   ```sh
+   cp output/images/Image /media/<user>/<p1>/
    ```
-   kernel=Image
+   ```
    arm_64bit=1
+   [pi5]
+   kernel=Image
    ```
-3. Прибрати зайве від Pi OS Lite.
-4. Додати параметри інтерфейсів у `config.txt` (див. крок 3).
+5. У `cmdline.txt` корінь вказати на розділ Buildroot (у Pi OS там `root=PARTUUID=…`):
+   ```
+   console=tty1 root=/dev/mmcblk0p2 rootfstype=ext4 fsck.repair=yes rootwait
+   ```
+6. Додати параметри інтерфейсів у `config.txt` (крок 3).
 
-> Підтверджено на цьому проєкті (`cat /etc/os-release` → `NAME=Buildroot`,
-> `cat /proc/1/comm` → `init`, `apt` відсутній): коренева ФС — **Buildroot**,
-> init — **BusyBox**. Тобто образ **повністю власний: ядро + userland Buildroot**,
-> а від Raspberry Pi OS Lite використано лише boot-розділ (firmware/bootloader Pi 5).
+Додатково на картці створено розділ **p3** `data` (ext4, решта місця). Для роботи демона
+він не потрібен: база карток і журнал лежать на p2 (`/etc`, `/var/lib`).
+
+> **Перевірено на платі** (19.11.2026):
+>
+> | Що | Значення | Висновок |
+> |---|---|---|
+> | `/proc/partitions` | p1 = 32 МБ, p2 = 120 МБ | розмітка `sdcard.img` Buildroot (у Pi OS Lite p1 = 512 МБ, p2 на всю картку) |
+> | `blkid` p1 | без `LABEL` | FAT створено genimage, а не Pi OS (там `bootfs`) |
+> | `/etc/os-release` | `NAME=Buildroot`, `2026.08` | rootfs — Buildroot |
+> | `/proc/1/comm`, `/sbin/init` | `init` → `../bin/busybox` | init — BusyBox; `apt`/`systemctl` відсутні |
+> | `/proc/cmdline` | `root=/dev/mmcblk0p2 rootfstype=ext4` | корінь — p2 |
+> | p1: `issue.txt` | `Raspberry Pi reference 2026-09-15, pi-gen` | boot-файли — з Pi OS Lite |
+> | p1: `Image` | дата збірки Buildroot | ядро — Buildroot |
+>
+> Тобто **ядро і весь userland — Buildroot**, розмітка — Buildroot; від Raspberry Pi OS Lite
+> лише dtb/overlays/config на FAT-розділі. Bootloader Pi 5 живе в EEPROM плати.
 > Наслідок для сервісу: init — BusyBox, тож запуск ставиться скриптом
 > `init/S99security-daemon` (а не systemd-юнітом).
-
 
 ---
 
@@ -103,6 +130,9 @@ Buildroot зібрав крос-тулчейн і CMake toolchain-файл:
 dtparam=spi=on        # /dev/spidev0.0  (RC522)
 dtparam=i2c_arm=on    # /dev/i2c-1      (SHT3x)
 ```
+
+Також у `config.txt` на платі: `dtoverlay=uart0-pi5` (UART0 на GPIO14/15 — консоль для
+налагодження). `dtparam=i2s=on` і `dtparam=audio=on` лишились від Pi OS, проєкту не потрібні.
 
 Перевірка на платі:
 ```sh
@@ -187,8 +217,10 @@ systemctl reload security_daemon              # SIGHUP -> перечитати �
 xz -T0 hsc-pi5.img
 ```
 
-> **Перед публікацією** прибери з boot-розділу `user-data` і `network-config` (лишились від
-> Raspberry Pi Imager): там Wi‑Fi пароль і хеш пароля користувача. Buildroot їх не використовує.
+> **Перед публікацією** прибери з boot-розділу `user-data`, `network-config` і `meta-data`
+> (лишились від Raspberry Pi Imager): там Wi‑Fi пароль і хеш пароля користувача.
+> Buildroot їх не використовує. Для образу всієї картки врахуй, що p3 `data` займає ~30 ГБ —
+> або зменш/прибери його, або публікуй лише p1 + p2.
 
 ---
 
