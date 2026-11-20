@@ -18,7 +18,9 @@ STDERR_LOG="/var/lib/security_daemon/stderr.log"
 export SECURITY_WATCHDOG="/dev/watchdog"
 
 # Годинник: у Pi 5 без батарейки RTC і без мережі час після старту = 1970.
-# Пробуємо RTC, далі (у фоні, якщо є мережа) NTP. Помилки не критичні.
+# Пробуємо RTC, далі (у фоні) NTP — лише якщо в образі є ntpd (у поточному BusyBox
+# аплет не ввімкнений, тож блок пропускається) і є інтернет. Помилки не критичні.
+# Без батарейки RTC скидається при знеструмленні: час дає deploy (hwclock -w).
 sync_clock() {
 	hwclock -s -u >/dev/null 2>&1
 	if command -v ntpd >/dev/null 2>&1; then
